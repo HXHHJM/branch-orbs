@@ -38,12 +38,22 @@ function candidates(root) {
   } catch (_) {}
   // ② 环境变量直指（CI / 自测）
   if (process.env.BRANCH_ORBS_ELECTRON) out.push(process.env.BRANCH_ORBS_ELECTRON);
+  // ②' 固化安装位置：install 时把 electron 运行时拷到这里（见 scripts/install-electron.sh）。
+  //    ⚠ 踩过的坑：用户从桌面图标启动 VSCode 时，进程环境里**没有** BRANCH_ORBS_ELECTRON，
+  //    之前只靠环境变量 + VSCode 内嵌副本（VSCode 根本不带）→ 永远找不到 → 弹"看不到悬浮球"。
+  const home = os.homedir();
+  out.push(path.join(home, '.branch-orbs', 'electron', 'node_modules', 'electron', 'dist', 'electron'));
   // ③ VSCode 自己的 Electron：把 resources/app 换成一个只有 main 的临时 app 目录即可复用二进制
-  //    这条在"用户机器上只有 VSCode、没装 electron"时是唯一的出路。
   const vscodeRes = process.env.VSCODE_RESOURCES || '/usr/share/code/resources';
   out.push(path.join(vscodeRes, 'app', 'node_modules', 'electron', 'dist', 'electron'));
-  // ④ 常见系统安装位置
-  out.push('/usr/lib/electron/electron', '/usr/lib/electron4/electron', '/opt/Electron/electron');
+  // ④ 常见系统安装位置 + npm 全局
+  out.push(
+    '/usr/lib/electron/electron',
+    '/usr/lib/electron4/electron',
+    '/opt/Electron/electron',
+    path.join(home, '.npm-global', 'lib', 'node_modules', 'electron', 'dist', 'electron'),
+    '/usr/lib/node_modules/electron/dist/electron'
+  );
   if (process.platform === 'darwin') out.push('/Applications/Visual Studio Code.app/Contents/MacOS/Electron');
   if (process.platform === 'win32') {
     out.push(path.join(process.env.LOCALAPPDATA || '', 'Programs', 'Microsoft VS Code', 'Code.exe'));
@@ -51,8 +61,43 @@ function candidates(root) {
   return out.filter(Boolean);
 }
 
+/** 浅扫兜底：上面全失败时在 home//opt//usr/local 里找形如 dist/electron 的二进制（深度 4） */
+function shallowFindElectron() {
+  if (process.platform === 'win32') return [];
+  const roots = [os.homedir(), '/opt', '/usr/local'];
+  const found = [];
+  const MAX = 4;
+  const walk = (dir, depth) => {
+    if (depth > MAX || found.length >= 5) return;
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch (_) {
+      return;
+    }
+    for (const e of entries) {
+      if (found.length >= 5) return;
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) {
+        if (['proc', 'sys', 'dev', 'snap', 'lib32', 'libx32', 'share', 'man'].includes(e.name)) continue;
+        walk(full, depth + 1);
+      } else if (e.name === 'electron' && dir.endsWith(path.join('dist')) ) {
+        try {
+          fs.accessSync(full, fs.constants.X_OK);
+          found.push(full);
+        } catch (_) {}
+      }
+    }
+  };
+  for (const r of roots) walk(r, 0);
+  return found;
+}
+
 function findElectron(root) {
   for (const c of candidates(root)) {
+    if (exists(c)) return c;
+  }
+  for (const c of shallowFindElectron()) {
     if (exists(c)) return c;
   }
   return null;
@@ -115,4 +160,4 @@ function spawnEnv(root, opts) {
   return env;
 }
 
-module.exports = { findElectron, launchArgs, spawnEnv, makeShimApp, devShmTooSmall, candidates };
+module.exports = { findElectron, launchArgs, spawnEnv, makeShimApp, devShmTooSmall, candidates, shallowFindElectron };
