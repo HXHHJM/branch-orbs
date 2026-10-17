@@ -113,6 +113,90 @@ function activate(context) {
   rawLog('git=' + resolveGit());
   rawLog('workspaceFolders=' + JSON.stringify((vscode.workspace.workspaceFolders || []).map((f) => f.uri.fsPath)));
 
+  /* ── 状态栏豆子 ──
+     ⚠ 踩过的坑：悬浮球是**另一个进程画的窗口**，它可能被别的窗口盖住、
+       可能因为找不到 Electron 起不来、也可能飘在屏幕边缘用户根本没注意。
+       一旦如此，用户界面上就"什么都没有"，看起来像扩展没装。
+       所以这里在 VSCode 自己的状态栏常驻一颗豆子 —— 它在编辑器里一定可见，
+       点一下就能显示/隐藏悬浮球。球没出来时，用户至少知道扩展活着。 */
+  const statusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
+  statusItem.command = 'branchOrbs.toggle';
+  function renderStatus() {
+    const repos = diagnostic.repos || [];
+    const r = repos.find((x) => x.isActive) || repos[0];
+    if (!r) {
+      statusItem.text = '$(circle-large-outline) Branch Orbs';
+      statusItem.tooltip = '还没有识别到 git 仓库。点击查看自检，或打开一个 git 项目。';
+    } else {
+      const extra = repos.length > 1 ? ' +' + (repos.length - 1) : '';
+      statusItem.text = '$(circle-large-filled) ' + r.branch + extra;
+      const lines = [
+        'Branch Orbs（点击显示/隐藏悬浮球）',
+        '分支：' + r.branch + (r.isActive ? '  ← 当前文件' : ''),
+      ];
+      if (r.ahead || r.behind) lines.push('领先 ' + r.ahead + ' / 落后 ' + r.behind);
+      lines.push('改动文件：' + (r.changed || 0) + '   增删行：+' + (r.added || 0) + ' -' + (r.deleted || 0));
+      if (r.lastCommit) lines.push('最近：' + r.lastCommit.subject + '  (' + r.lastCommit.when + ')');
+      if (repos.length > 1) {
+        lines.push('');
+        lines.push('全部仓库：');
+        for (const x of repos) lines.push('  · ' + x.name + '  [' + x.branch + ']');
+      }
+      statusItem.tooltip = lines.join('\n');
+    }
+    statusItem.show();
+  }
+
+  /* ── 兜底数据源：VSCode 自带 git 扩展的 API ──
+     我们的主通道是直接跑 git 命令。但万一机器上没有 git、或 PATH 异常、
+     或 git 版本太老不支持 --porcelain=v2，主通道会空手而归。
+     此时 VSCode 内置 git 扩展（如果启用）已经算好了同样的数据 —— 借它的结果，
+     至少能让豆子和球显示正确的分支名。 */
+  async function reposFromVscodeGit() {
+    let ext;
+    try {
+      ext = vscode.extensions.getExtension('vscode.git');
+    } catch (_) {
+      return null;
+    }
+    if (!ext) return null;
+    try {
+      if (!ext.isActive) {
+        // 别 await 太久：内置 git 扩展在超大仓库上激活可能很慢，超时就放弃这条兜底
+        await Promise.race([ext.activate(), new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 3000))]);
+      }
+      const api = ext.exports && (ext.exports.getAPI ? ext.exports.getAPI(1) : ext.exports);
+      if (!api || !api.repositories) return null;
+      const list = api.repositories;
+      if (!list || list.length === 0) return null;
+      const out = [];
+      for (const repo of list) {
+        const h = repo.state && repo.state.HEAD;
+        const root = repo.rootUri && repo.rootUri.fsPath;
+        if (!root) continue;
+        out.push({
+          root,
+          name: path.basename(root),
+          branch: (h && h.name) || (h && h.commit ? '@' + String(h.commit).slice(0, 7) : '(no commits)'),
+          detached: !!(h && !h.name && h.commit),
+          ahead: (h && h.ahead) || 0,
+          behind: (h && h.behind) || 0,
+          changed: (repo.state && repo.state.workingTreeChanges ? repo.state.workingTreeChanges.length : 0) +
+            (repo.state && repo.state.indexChanges ? repo.state.indexChanges.length : 0),
+          added: 0,
+          deleted: 0,
+          lastCommit: null,
+          isActive: false,
+          error: null,
+        });
+      }
+      return out;
+    } catch (e) {
+      log('vscode.git 兜底失败：' + e.message);
+      return null;
+    }
+  }
+
   /* ── 数据源：一个目录里的 git 命令 ── */
   const model = {
     exec: (cwd, args) => {
@@ -174,6 +258,12 @@ function activate(context) {
   }
   let shell = null;
   let lastCfg = null;
+
+  /* ⚠ 这个变量必须在使用它的函数（ensureShell / refresh）之前声明。
+     之前它被放在了 refresh 附近（靠后），而 ensureShell 在激活末尾就会被调用 ——
+     `const` 的 TDZ 会让 ensureShell 抛 ReferenceError，整个激活链条断在这里，
+     界面上表现依旧是"什么都没发生"。所有"只提示一次"的闸门统一放这里。 */
+  const warned = { empty: false, launch: false };
 
   const diagnostic = {
     lane: null,
@@ -318,7 +408,6 @@ function activate(context) {
   /* ── 刷新仓库 ── */
   let refreshing = null;
   let lastRefreshAt = 0;
-  const warned = { empty: false, launch: false };
   async function refresh(force) {
     const now = Date.now();
     if (!force && now - lastRefreshAt < 300) return diagnostic.repos;
@@ -345,7 +434,23 @@ function activate(context) {
         }
       }
       diagnostic.repos = repos;
+
+      /* 主通道空手而归时走兜底 —— 否则用户只看到"没有球"，而内置 git 明明知道分支。 */
+      if (repos.length === 0) {
+        const alt = await reposFromVscodeGit();
+        if (alt && alt.length) {
+          const activeRoot2 = aDir ? gitModel.findGitRoot(aDir) : null;
+          for (const x of alt) x.isActive = !!activeRoot2 && x.root === activeRoot2;
+          diagnostic.repos = alt;
+          log('主通道无仓库，采用 vscode.git 兜底：' + alt.length + ' 个');
+          if (shell && shell.alive()) shell.send({ type: 'repos', repos: stripHeavy(alt) });
+          renderStatus();
+          return alt;
+        }
+      }
+
       if (shell && shell.alive()) shell.send({ type: 'repos', repos: stripHeavy(repos) });
+      renderStatus();
 
       /* 静默失败是最糟的体验：球不出来，用户完全不知道发生了什么。
          这里把两种"必然没球"的原因显式说出来（只提示一次，别反复弹）。 */
@@ -421,6 +526,7 @@ function activate(context) {
   /* ── 注册 ── */
   context.subscriptions.push(
     channel,
+    statusItem,
     { dispose: () => shell && shell.stop() },
     vscode.commands.registerCommand('branchOrbs.toggle', () => toggle()),
     vscode.commands.registerCommand('branchOrbs.refresh', async () => {
@@ -508,9 +614,15 @@ function activate(context) {
   }, 1500);
   context.subscriptions.push({ dispose: () => clearInterval(timer) });
 
+  /* 先把状态栏豆子亮起来 —— 这一行一定成功（纯 VSCode API），
+     即便后面壳进程起不来，用户也能在状态栏看到扩展在跑、能点开自检。 */
+  renderStatus();
+
   if (vscode.workspace.getConfiguration('branchOrbs').get('enabled', true)) {
     ensureShell();
   }
+  // 无论球能不能起来，都把仓库读一遍：豆子需要数据，自检也需要
+  refresh(true).catch((e) => log('首次 refresh 失败：' + (e && e.message)));
 }
 
 function deactivate() {}

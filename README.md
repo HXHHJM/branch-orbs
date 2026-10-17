@@ -93,10 +93,36 @@ src/extension.js  ──JSONL over stdin/stdout──▶  shell/main.js（独立
 ## 开发 / 自测
 
 ```bash
-node test/git-selftest.js     # 16 条：git 解析（含中文路径、detached、二进制 numstat）
-node test/shell-selftest.js   # 35 条：窗口几何、穿透、悬停、卡片、四种停靠
-node test/live-scene.js       # 实景出图：真跑在 X11 上，输出几何证据 + 截图
+node test/git-selftest.js       # 16 条：git 解析（含中文路径、detached、二进制 numstat）
+node test/activate-selftest.js  # 9 条：激活全流程（假 vscode 模块跑真实 activate）
+node test/shell-selftest.js     # 35 条：窗口几何、穿透、悬停、卡片、四种停靠
+node test/live-scene.js         # 实景出图：真跑在 X11 上，输出几何证据 + 截图
 ```
+
+`activate-selftest.js` 可以用 `--workspace <目录>` 指定工作区，验证分支名是否被正确读出：
+
+```bash
+node test/activate-selftest.js --workspace /path/to/your/repo
+```
+
+它守的是"扩展一激活就炸"这一类问题。因为悬浮球画在**另一个进程**里，激活中途抛异常时，
+界面上既没有球也没有报错，用户看到的现象跟"扩展没装"完全一样。
+（真实踩过：`warned` 声明在使用它的函数之后，撞 `const` 的 TDZ，activate 直接中断。）
+
+## 状态栏豆子：看不到球时的第一手信号
+
+激活时会在状态栏右侧常驻一颗豆子，内容就是当前分支名：
+
+```
+$(circle-large-filled) new_s11x_motor
+```
+
+- **点击** → 显示/隐藏悬浮球（等同 `Branch Orbs: 显示/隐藏悬浮球`）
+- **悬停** → 分支、领先/落后、改动文件数、增删行数、最近一条提交
+- 没识别到仓库时显示 `$(circle-large-outline) Branch Orbs`
+
+有了它，即使悬浮球被其他窗口盖住、或 Electron 起不来，你也能立刻确认：
+**扩展活着、git 读到了、分支是哪个**。
 
 打包：`npm run package`（或 `npx vsce package --no-dependencies --allow-missing-repository`）。
 
