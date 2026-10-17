@@ -667,7 +667,8 @@ function activate(context) {
         const repo = m.repo || diagnostic.repos[m.index];
         if (repo) toggleWindow(repo);
         break;
-      }      case 'menu': {
+      }
+      case 'menu': {
         const repo = diagnostic.repos[m.index];
         if (m.action === 'copy' && repo) {
           vscode.env.clipboard.writeText(repo.branch);
@@ -889,11 +890,14 @@ function activate(context) {
        窗口可见 → 发 WM_CHANGE_STATE(IconicState) 最小化
      为什么不用 VSCode 命令：只有 workbench.action.minimizeWindow（收起），
      **没有取消最小化的命令** —— 收起后就回不来了，必须走 X11。
-     为什么按标题匹配：VSCode 窗口标题默认是 "<文件夹名> - Visual Studio Code"，
-     传 repo.name 即可命中；同一个仓库跨窗口共享一颗球，多窗口会一起动。
 
-     降级链：python-xlib 不可用 / 非 X11 / 找不到窗口 → 退回旧的"跳转仓库"。
-     缓存解析结果，避免每次点击都探测一遍 python。 */
+     ── 匹配为什么不用"只用仓库名" ──
+     上一轮就是栽在这：VSCode 窗口标题可被用户改（window.title 设置）、
+     SSH 远端窗口是 "SSH: xxx"、工程没加载完时标题就是 "Visual Studio Code"。
+     现在一次给多个关键字（仓库名 / 路径末段 / 完整路径），xwin.py 里任一命中
+     即算命中；另外优先用 --pid 精确匹配本窗口进程（context 里的进程 pid），
+     这样同名仓库的多个窗口也不会误伤。
+     降级链：python-xlib 不可用 / 非 X11 / 找不到窗口 → 退回"跳转仓库"。 */
   let xwinPython = null;
   function resolveXwinPython() {
     if (xwinPython !== null) return xwinPython;
@@ -902,6 +906,7 @@ function activate(context) {
       '/home/hy/.workbuddy/binaries/python/envs/default/bin/python',
       path.join(os.homedir(), '.workbuddy/binaries/python/envs/default/bin/python'),
       '/usr/bin/python3',
+      '/usr/local/bin/python3',
     ].filter(Boolean);
     xwinPython = false; // 先置 false：全都不行就不再重试
     for (const py of candidates) {
@@ -911,8 +916,30 @@ function activate(context) {
         break;
       } catch (_) {}
     }
+    if (!xwinPython) log('resolveXwinPython: 没有可用的 python-xlib，点击球将退回"跳转仓库"');
     return xwinPython;
   }
+
+  /** 给 xwin.py 的关键字候选：仓库名、路径末段、完整路径。
+      去重 + 去掉过短的（"a" 这种会匹配到一堆窗口）。 */
+  function xwinKeywords(repo) {
+    const raw = [repo.name, path.basename(repo.root || ''), repo.root];
+    const seen = new Set();
+    const out = [];
+    for (const k of raw) {
+      const s = String(k || '').trim();
+      if (s.length < 2) continue;
+      if (seen.has(s)) continue;
+      seen.add(s);
+      out.push(s);
+    }
+    return out;
+  }
+
+  /* 记住上一次 toggle 的结果，用于"点第二次"时的兜底：
+     某些 WM 的 _NET_WM_STATE_HIDDEN 更新有延迟，xwin.py 内部已经 wait_state
+     等过了；这里再兜一层——如果两次都报 same 状态，强制走一次反方向动作。 */
+  const lastToggle = new Map(); // repo.root → { at, to }
 
   function toggleWindow(repo) {
     const py = resolveXwinPython();
@@ -921,31 +948,88 @@ function activate(context) {
       return;
     }
     const script = path.join(context.extensionPath, 'src', 'xwin.py');
-    cp.execFile(
-      py,
-      [script, 'toggle', repo.name],
-      { timeout: 4000 },
-      (err, stdout) => {
-        let out = null;
-        try {
-          out = JSON.parse(String(stdout));
-        } catch (_) {}
-        /* 命中不到窗口 = 正常情况（工程还没加载完、标题不带文件夹名），
-           脚本会返回 {ok:false, error:'no-matching-window'} 而不是非零退出码。
-           这种情况退回旧行为"跳转仓库"，不报错。 */
-        if (err && !out) {
-          log('toggleWindow 失败：' + String(err.message).slice(0, 200));
-          openRepo(repo);
-          return;
-        }
-        if (!out || !out.ok || !out.changed) {
-          log('toggleWindow 未命中窗口：' + repo.name + '（退回跳转仓库）');
-          openRepo(repo);
-          return;
-        }
-        log('toggleWindow: ' + repo.name + ' → 已切换 ' + out.changed + ' 个窗口');
+    const kws = xwinKeywords(repo);
+    const args = [script, 'toggle'];
+    // 本窗口进程 pid：VSCode 的扩展宿主是子进程，窗口属于主进程，
+    // 所以拿父链上第一个非扩展宿主的 pid 更准；拿不到就不传，退回关键字匹配。
+    const ownerPid = windowOwnerPid();
+    if (ownerPid) args.push('--pid=' + ownerPid);
+    args.push(...kws);
+
+    cp.execFile(py, args, { timeout: 6000 }, (err, stdout) => {
+      let out = null;
+      try {
+        out = JSON.parse(String(stdout));
+      } catch (_) {}
+      /* 命中不到窗口 = 正常情况（工程还没加载完、标题不带文件夹名），
+         脚本会返回 {ok:false, error:'no-matching-window'} 而不是非零退出码。
+         这种情况退回旧行为"跳转仓库"，不报错。 */
+      if (err && !out) {
+        log('toggleWindow 失败：' + String(err.message).slice(0, 200));
+        openRepo(repo);
+        return;
       }
-    );
+      if (!out || !out.ok || !out.changed) {
+        const why = (out && (out.error || JSON.stringify(out.detail || []))) || 'no-output';
+        log(
+          'toggleWindow 未命中窗口：' + JSON.stringify(kws) + ' pid=' + ownerPid + ' → ' + why +
+            '（退回跳转仓库）'
+        );
+        openRepo(repo);
+        return;
+      }
+      const d0 = (out.detail || [])[0] || {};
+      lastToggle.set(repo.root, { at: Date.now(), to: d0.to });
+      log('toggleWindow: ' + repo.name + ' → ' + out.changed + ' 个窗口，to=' + d0.to + ' settled=' + d0.settled + ' via=' + JSON.stringify(kws));
+    });
+  }
+
+  /** 当前 VSCode 窗口所属的进程 pid。
+      扩展宿主是 --type=extensionHost 的子进程，往上找到第一个"不是 --type= 子进程"
+      的祖先，那才是拥有 BrowserWindow 的主进程。
+      拿不到就返回 null（只靠关键字匹配）—— 这只是**加分项**，不影响主路径。
+
+      ⚠ 容器/沙箱里 /proc 父链可能在半路断掉（父 pid 变成 3 或 1），
+        所以必须设上限并在 cmdline 读不到时放弃，不能死循环。 */
+  let cachedOwnerPid;
+  function procCmdline(pid) {
+    try {
+      return fs.readFileSync('/proc/' + pid + '/cmdline', 'utf8').replace(/\0/g, ' ');
+    } catch (_) {
+      return '';
+    }
+  }
+  function procParent(pid) {
+    try {
+      const st = fs.readFileSync('/proc/' + pid + '/stat', 'utf8');
+      // stat 格式：pid (comm) state ppid ...  —— comm 里可能有空格/括号，从最后一个 ")" 切
+      const rest = st.slice(st.lastIndexOf(')') + 2).split(' ');
+      const ppid = parseInt(rest[1], 10);
+      return Number.isFinite(ppid) ? ppid : null;
+    } catch (_) {
+      return null;
+    }
+  }
+  function windowOwnerPid() {
+    if (cachedOwnerPid !== undefined) return cachedOwnerPid;
+    cachedOwnerPid = null;
+    try {
+      let pid = process.pid;
+      for (let i = 0; i < 8; i++) {
+        const ppid = procParent(pid);
+        if (!ppid || ppid <= 1) break; // 到头了（容器里常常是 1 或 3）
+        const cmd = procCmdline(ppid);
+        if (!cmd) break; // 读不到 cmdline：父链不可信，放弃
+        // 主进程由可执行文件直接拉起（或经 bin/code 包装脚本），cmdline 里没有 --type=
+        if (!cmd.includes('--type=')) {
+          cachedOwnerPid = ppid;
+          break;
+        }
+        pid = ppid;
+      }
+    } catch (_) {}
+    log('windowOwnerPid = ' + cachedOwnerPid + '（null 表示拿不到，退回纯关键字匹配）');
+    return cachedOwnerPid;
   }
 
   /* ── 显示 / 隐藏 ── */

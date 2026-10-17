@@ -39,10 +39,59 @@ code --install-extension branch-orbs-0.1.0.vsix
 | 动作 | 效果 |
 | --- | --- |
 | 悬停 | 球上探 + 信息卡（分支名 / 仓库名 / ↑↓ / 最近提交） |
-| 左键点球 | 打开该仓库（已在工作区则打开源代码管理面板） |
+| 左键点球 | **展开 / 收起对应的 VSCode 窗口**（最小化 ⇄ 恢复置前） |
 | 右键 | 复制分支名 / 打开 / 刷新 / 隐藏 |
 | 沿底边拖球 | 调整 `branchOrbs.offset`（自动写回设置） |
 | 命令面板 `Branch Orbs` | 显示 / 隐藏 / 刷新 / 诊断 |
+
+### 点球展开 / 收起窗口是怎么做的
+
+VSCode **只提供** `workbench.action.minimizeWindow`（收起），**没有取消最小化的命令** ——
+收起来就回不来了。所以这条路必须绕到窗口管理器层，走 X11 EWMH：
+
+| 方向 | 发出的消息 | 说明 |
+| --- | --- | --- |
+| 收起 | `WM_CHANGE_STATE` + `IconicState` | 等价于 ICCCM 的 `XIconifyWindow` |
+| 展开 | `_NET_ACTIVE_WINDOW` | 恢复并置前（`source=1` pager 来源） |
+| 判态 | `_NET_WM_STATE` 里是否含 `_NET_WM_STATE_HIDDEN` | 决定这次是收起还是展开 |
+
+实现在 `src/xwin.py`（纯 `python-xlib`，不需要 xdotool/wmctrl）。
+
+**窗口怎么匹配到具体的球**，按优先级：
+
+1. **PID 精确匹配** —— 窗口的 `_NET_WM_PID` == 本窗口主进程 pid。与标题完全无关，最可靠。
+   扩展向上遍历 `/proc` 父链，跳过 `--type=extensionHost` 这类子进程，找到真正持有
+   `BrowserWindow` 的主进程。
+2. **标题包含关键字** —— 关键字是「仓库名 / 路径末段 / 完整路径」，任一命中即可。
+3. **类名包含关键字** —— 同上。
+
+> 为什么不能只用「仓库名匹配标题」：
+> 窗口标题可以被 `window.title` 设置改掉、SSH 远端窗口标题是 `SSH: xxx`、
+> 工程还没加载完时标题就是 `Visual Studio Code`。这三种情况下按仓库名匹配**全部失效**。
+
+`_NET_WM_STATE_HIDDEN` 由窗口管理器异步更新，所以 `xwin.py` 每次动作后都会
+`wait_state()` 轮询到状态真正改变才返回（`settled` 字段），避免"连点两下失效"的竞态。
+
+**非 X11 环境**（Windows / macOS / Wayland-only / 没有 python-xlib）会自动降级成
+「跳转到该仓库」，不会报错。
+
+排查点击无效：
+
+```bash
+# 看当前能匹配到哪些 VSCode 窗口
+python3 src/xwin.py list
+# 试匹配（不动窗口）
+python3 src/xwin.py probe 你的仓库名
+# 在本机做一轮 minimize→activate 往返验证
+python3 src/xwin.py selftest
+```
+
+### 跑全部自检
+
+```bash
+bash test/all.sh              # 8 个自检，约 106 条断言
+WITH_SHELL=1 bash test/all.sh # 额外跑"真起 Electron 壳"（慢，需要 X）
+```
 
 ## 配置（settings.json）
 
