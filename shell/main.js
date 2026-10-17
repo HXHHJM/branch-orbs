@@ -2097,6 +2097,9 @@ function runPresentLab() {
       { name: 'B-x11', flags: ['--no-sandbox', '--ozone-platform=x11', '--disable-dev-shm-usage'] },
       { name: 'C-x11-nogpu', flags: ['--no-sandbox', '--ozone-platform=x11', '--disable-gpu', '--disable-dev-shm-usage'] },
       { name: 'D-wayland', flags: ['--no-sandbox', '--ozone-platform=wayland', '--disable-dev-shm-usage'] },
+      { name: 'E-x11-noviz', flags: ['--no-sandbox', '--ozone-platform=x11', '--disable-viz-display-compositor', '--disable-dev-shm-usage'] },
+      { name: 'F-default-noviz', flags: ['--no-sandbox', '--disable-viz-display-compositor', '--disable-dev-shm-usage'] },
+      { name: 'G-x11-inprocgpu', flags: ['--no-sandbox', '--ozone-platform=x11', '--in-process-gpu', '--disable-dev-shm-usage'] },
     ];
     const procs = [];
     variants.forEach((v, i) => {
@@ -2111,7 +2114,7 @@ function runPresentLab() {
         procs.push(p);
       } catch (e) { log('LAB spawn失败', v.name, e.message); }
     });
-    log('LAB: 已拉起 4 个测试窗，10s 后读帧…');
+    log('LAB: 已拉起 7 个测试窗，14s 后读帧…');
     setTimeout(() => {
       const pys = (typeof pythonCandidates === 'function' && pythonCandidates()) || [];
       const readScript = [
