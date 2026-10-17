@@ -375,7 +375,24 @@
     var t = orbAt(e.target);
     if (!t) return;
     down = { i: +t.dataset.i, sx: e.screenX, sy: e.screenY, moved: false, button: e.button, id: e.pointerId };
-    if (e.button === 0) { try { dock.setPointerCapture(e.pointerId); } catch (_) {} }
+    /* ⚠⚠ 这里**不调 setPointerCapture**。踩过的坑，非常隐蔽：
+
+       Linux/XWayland 下，对一个铺满工作区的 overlay 窗口做 pointer grab
+       （setPointerCapture 底层就是 XGrabPointer），XWayland 会把指针
+       "安置"到一个 fallback 位置。实测：
+
+         pointerdown@831,846   ← 按下时坐标正确
+         pointerup@680,425     ← 抬起时指针已被搬到 (680,425)
+
+       而 (680,425) 在每次实验里都一模一样，是 XWayland 的固定 fallback。
+       后果：pointerup 的坐标错了 → 主进程下一帧轮询读到 idx=-1
+             → 卡片收回、lane 回 idle，整个点击看着像"点空了"。
+
+       为什么可以不要 capture：拖动判定用的是 window 上的 pointermove，
+       而窗口 shape 在 harness 态下覆盖整个球带 + 卡片带，
+       指针在拖动过程中不会离开窗口（就算离开，主进程会收起 hot，
+       拖动自然结束，也是合理行为）。
+       capture 在这里只是"保险"，而它带来的副作用远大于收益。 */
     e.preventDefault();
   });
   window.addEventListener('pointermove', function (e) {
@@ -389,7 +406,6 @@
   window.addEventListener('pointerup', function (e) {
     if (!down) return;
     var d = down; down = null;
-    try { dock.releasePointerCapture(e.pointerId); } catch (_) {}
     if (d.moved) { post('dragend', {}); return; }
     if (d.button === 0) post('click', { index: d.i });
     else if (d.button === 2) post('context', { index: d.i, x: e.clientX, y: e.clientY });
@@ -404,6 +420,12 @@
       if (!msg || msg.type !== 'state') return;
       repos = msg.repos || [];
       cfg = Object.assign(cfg, msg.cfg || {});
+      /* ⚠ 主进程一推 state 就说明它有轮询在跑（Linux 一定有），
+         悬停判定权必须立刻交给它。原来只在 __orbsHover 被调用后才交权，
+         而"指针在球带但不在球上"时那个函数不会被调用 ——
+         保护形同虚设，页面的 pointerleave 就会把刚亮的球熄掉，
+         与主进程来回打架，表现为高频闪动。 */
+      if (msg.driverHot) driverHot = true;
       if (typeof msg.opaque === 'boolean') lastOpaque = msg.opaque;
       if (typeof msg.shift === 'number') {
         var moved = msg.shift !== lastShift;

@@ -21,19 +21,38 @@ if (process.env.BRANCH_ORBS_USER_DATA) {
   app.setPath('userData', process.env.BRANCH_ORBS_USER_DATA);
 }
 
-/* ⚠ 必须强制 X11，绝不能用 auto（auto 会选中 Wayland）：
-     用户桌面是 GNOME Wayland 会话时，ozone-platform-hint=auto 让壳跑在
-     Wayland 后端上。而 **Wayland 协议不允许客户端给窗口定位**——
-     setBounds 传的 x/y 会被合成器无视，窗口被摆到它想放的地方
-     （实测球出现在屏幕中上部而不是沉在底边）。
-     更坑的是 Electron 的 getBounds() 返回的是"请求值"，
-     日志里 bounds=936,1030 看起来全对，视觉上完全不对。
-     XWayland 下 X11 客户端可以自定位置（ConfigureRequest），mutter 会尊重。
-     可用 BRANCH_ORBS_OZONE=wayland 覆盖（纯 Wayland 无 XWayland 的环境）。 */
-app.commandLine.appendSwitch(
-  'ozone-platform',
-  process.env.BRANCH_ORBS_OZONE || 'x11'
-);
+/* ⚠⚠⚠ 这一整段是"球一直不出现"的最终根因，改之前务必读完。
+
+   原来的写法：
+     app.commandLine.appendSwitch('ozone-platform', 'x11')
+   **不生效**。Ozone 平台的选择发生在 Chromium 初始化最早期
+   （electron_main_delegate 里就定了），比 JS 入口更早；
+   JS 里的 appendSwitch 只是在事后往命令行尾部补一条，平台早选完了。
+   于是壳跑在 **Wayland ozone 后端**上，连锁假象（全部实测）：
+
+     · Electron 自认为正常：isVisible()=true，getBounds() 精确正确
+     · 球其实画在 Wayland 面上，看不到 X 窗口
+     · X11 侧只留一个占位窗口，id 恒为 0x1（非法 ID）
+     · 日志：XGetWindowAttributes failed for window 1
+     · getNativeWindowHandle() → 0x1；xprop -id 0x1 → BadWindow
+     · xwininfo -root -tree 里永远没有那个 48×50 的窗口
+   ——也就是说我们之前所有的 X 校验，都在查一个根本不存在的窗口。
+
+   正解：--ozone-platform=x11 必须作为**进程命令行参数**传入
+   （见 src/launcher.js 的 launchArgs）。实测对比：
+     仅 appendSwitch → handle=0x1，X 树里无此窗口
+     命令行传参     → handle=0x2400004，xwininfo 可见 65x68，
+                      _NET_WM_WINDOW_TYPE_NORMAL，WM_STATE: Normal  ✅
+
+   下面的自愈逻辑在 log() 定义之后（见文件后部「ozone 自愈」段），
+   因为它要用 log()，而 log 依赖 logFile 常量，放这里会 TDZ 崩。 */
+const WANT_OZONE = process.env.BRANCH_ORBS_OZONE || 'x11';
+const ozoneOnArgv = process.argv.some((a) => /^--ozone-platform=/.test(a));
+/* 先无条件补一条 appendSwitch：对少数构建仍然有效，且完全无害。
+   真正兜底的重启逻辑在 log() 定义之后执行。 */
+if (process.platform === 'linux' && WANT_OZONE === 'x11') {
+  app.commandLine.appendSwitch('ozone-platform', 'x11');
+}
 
 /* ── 关键开关：必须用 appendSwitch，不能靠命令行 ──
    ⚠ 这条是本轮排查的核心教训。把 --no-sandbox / --disable-dev-shm-usage
@@ -117,6 +136,42 @@ function log(...args) {
       }
     } catch (_) {}
   }
+}
+
+/* ── ozone 自愈：命令行没带 --ozone-platform=x11 就重启自己 ──
+   ⚠ 为什么必须重启而不是"补一下开关"：
+     走到这一行时 Chromium 的平台早已选定（Wayland），JS 再怎么 appendSwitch
+     都改不回来 —— 这正是本 bug 的本质。唯一的修法是用正确的命令行重新 exec。
+     子进程继承 stdin/stdout，扩展侧的 JSONL 协议完全无感。
+     加 BRANCH_ORBS_OZONE_REEXEC 防递归：万一子进程也认为没带，就认命继续跑。 */
+if (process.platform === 'linux' && WANT_OZONE === 'x11' && !ozoneOnArgv &&
+    !process.env.BRANCH_ORBS_OZONE_REEXEC) {
+  try {
+    const { spawn } = require('child_process');
+    /* process.argv[1] 起是"应用路径 + 应用参数"。
+       要在**应用路径之前**插入开关 —— 找到第一个真实存在的目录参数。 */
+    const rest = process.argv.slice(1);
+    const at = rest.findIndex((a) => {
+      try { return fs.statSync(a).isDirectory(); } catch (_) { return false; }
+    });
+    const next = rest.slice();
+    next.splice(at < 0 ? 0 : at, 0, '--ozone-platform=x11');
+    log('ozone 平台未在命令行指定 → 用 --ozone-platform=x11 重启壳（球可见的前提）');
+    const child = spawn(process.execPath, next, {
+      env: { ...process.env, BRANCH_ORBS_OZONE_REEXEC: '1' },
+      stdio: ['pipe', 'pipe', 'inherit'],
+    });
+    try { process.stdin.pipe(child.stdin); } catch (_) {}
+    child.stdout.pipe(process.stdout);
+    child.on('exit', (code) => process.exit(code == null ? 0 : code));
+    child.on('error', (e) => log('ozone 重启失败:', e.message));
+    /* 本进程就地停摆：不建窗口、不抢日志，等子进程接手后随父进程退出。 */
+    setInterval(() => {}, 1 << 30);
+  } catch (e) {
+    log('ozone 自愈失败（继续按 appendSwitch 跑，球可能不可见）:', e.message);
+  }
+} else if (process.platform === 'linux' && ozoneOnArgv) {
+  log('ozone 平台: 命令行已带 --ozone-platform=x11 ✓');
 }
 
 /* stdout 的异步错误必须就地吃掉：否则每次 EPIPE 都会触发 uncaughtException，
@@ -229,8 +284,37 @@ function xWorkArea() {
       });
       const r = JSON.parse((out || '').trim().split('\n').pop() || '{}');
       if (r && r.ok) {
-        cachedWA = { x: r.x, y: r.y, width: r.width, height: r.height };
-        log('workArea 来源 X _NET_WORKAREA:', JSON.stringify(cachedWA), 'desktop', r.desktop, 'py', py);
+        /* ⚠⚠ 坐标系必须统一到 **Electron 的逻辑像素（DIP）**，这是本轮另一个
+           隐蔽的根因，实测数据：
+             · _NET_WORKAREA（X 物理像素）：{0,31,1920,987}
+             · screen.getPrimaryDisplay().workArea（DIP）：{0,26,1661,855}
+             · scaleFactor = 1.15625
+           1920 / 1661 ≈ 1.156、987 / 855 ≈ 1.15 —— 同一个东西的两套坐标。
+           而 Electron 的 BrowserWindow 构造函数和 setBounds 收的都是**DIP**。
+           原来直接把 X 的 1920×987 当成 DIP 传进去，等于请求了一个
+           1920 DIP = 2220 物理像素的窗口 —— 这也是日志里一直看到
+           "X 报 2220x1142" 的真正原因（不是装饰！）。
+           副作用：窗口比工作区大一圈，球的"居中"算在错的基准上，
+           水平看着偏、下沉被裁、卡片位置也错。
+
+           正确做法：**位置和尺寸以 Electron 的 workArea 为准**，
+           X 只用来借"顶部有没有被顶栏占掉"这个信息（Wayland 下
+           Electron 的 workArea 有时不带顶栏高度）。 */
+        const ed = screen.getPrimaryDisplay();
+        const ewa = ed.workArea;
+        const sf = ed.scaleFactor || 1;
+        /* 把 X 的物理 y 偏移换算成 DIP，与 Electron 的取较大者（谁扣得多信谁） */
+        const xTopDip = Math.round(r.y / sf);
+        const topDip = Math.max(ewa.y, xTopDip);
+        cachedWA = {
+          x: ewa.x,
+          y: topDip,
+          width: ewa.width,
+          height: Math.max(1, ewa.y + ewa.height - topDip),
+        };
+        log('workArea（DIP）:', JSON.stringify(cachedWA),
+          '| Electron', JSON.stringify(ewa), '| X 物理', JSON.stringify({ x: r.x, y: r.y, width: r.width, height: r.height }),
+          '| scale', sf, '| py', py);
         return cachedWA;
       }
       log('workArea 读不到（' + py + '）:', r && r.error);
@@ -274,12 +358,16 @@ function workAreaFor(rect) {
     ? screen.getDisplayMatching(rect)
     : screen.getPrimaryDisplay();
   const ew = d.workArea;
-
+  /* ⚠ xWorkArea() 返回的已经是**换算好的 DIP**（见其内部注释：
+     _NET_WORKAREA 是物理像素，除以 scaleFactor 才是 DIP）。
+     这里直接整块用它，绝不能再混回 X 的 width/height ——
+     原来写的是 `{x: ew.x, y: xw.y, width: xw.width, height: xw.height}`，
+     把 DIP 的 y 和物理像素的 width/height 拼在一起，
+     于是窗口尺寸算成 1920×987（DIP），而真正的工作区只有 1661×855。
+     表现就是"窗口比工作区大一圈、球看起来偏、下沉被裁"。
+     现在整块取一个来源，保证同一坐标系。 */
   const xw = xWorkArea();
-  if (xw) {
-    // 用 X 的尺寸，但保留 Electron 给的 x 偏移（多显示器时更可靠）
-    return { x: ew.x, y: xw.y, width: xw.width, height: xw.height };
-  }
+  if (xw) return { x: xw.x, y: xw.y, width: xw.width, height: xw.height };
   return ew;
 }
 
@@ -309,20 +397,39 @@ function anchors() {
   const vertical = c.dock === 'bottom' || c.dock === 'top';
   const wide = Math.max(dockW, cardW);
 
-  /* ── Linux：全屏覆盖层模式（本轮"球跑屏幕中间"的根治方案） ──
-     现象：Electron setBounds(936,1030) 底部正中，球却出现在屏幕中上部。
-     原因：用户桌面是 GNOME Wayland 会话，ozone=auto 时壳跑在 Wayland 后端，
-       而 **Wayland 协议不允许客户端给窗口定位**，位置由合成器决定；
-       即使强制 X11（XWayland），mutter 对小窗口的位置映射同样不可靠
-       （实测 setBounds(806,830) 后 X 报告的实际位置是 (-933,-960)）。
-     对策：**窗口直接铺满整个工作区**（透明 + 点击穿透），
-       球由页面画在工作区底边/顶边 —— 窗口位置天然正确，
-       彻底不依赖任何 setBounds 定位。水平偏移（offset/拖动）改由页面内完成。
-     副作用控制：点击穿透由页面 hover 事件驱动（球上才接收点击），
-       空白区域始终 setIgnoreMouseEvents(true,{forward:true})，不挡下层应用。 */
-  /* ⚠ overlay 依赖透明：整屏铺一层看不见的窗口。
-     不透明降级后 overlay 就不成立了 —— 不透明窗口铺满工作区会盖死整个桌面。
-     所以降级时必须切回"小窗口只占球带一条"的形态。 */
+  /* ── Linux：铺满工作区 + shape 裁剪（最终方案，实测通过） ──
+
+     ⚠ 这一段的每个数字都是**实测**的，不是推测。同一份 Electron 43.7.7
+     （ozone=x11，mutter/XWayland），各种窗口形态下 X 报告的实际几何：
+
+       请求                      X 实际                Δ位置      判定
+       1920×987 @0,31          1924×996 @0,34       (+0,+3)    ✅ 准（铺满工作区）
+       1920×58  @0,960         1924×74  @0,1000     (+0,+40)   x准，y被往下推
+       1920×120 @0,923         1924×148 @0,981      (+0,+58)   x准，y被往下推
+       1920×200 @0,?           1924×238 @0,33       (+0,?)     高度超了就推
+       960×120  @480,923       1115×148 @555,870    (+75,-53)  ❌ 全偏
+       48×58    @936,949        65×77  @1081,941    (+145,-8)  ❌ 全偏
+
+     规律：
+       · **窗口宽度 = 工作区宽度 → x 精确**；不够宽就立刻偏（mutter 重排）
+       · **窗口高度 = 工作区高度 → y 也精确**；不够高就被往下推，
+         推到超过屏幕下沿也不管（"底边溢出"就是这么来的）
+       —— 也就是说，**只有"铺满整个工作区"这一种形态 mutter 完全不干预**。
+       小窗无论怎么摆都会被重排 100px 以上，而且偏移量随尺寸变，补偿不准。
+
+     所以正解是：窗口铺满工作区（位置天然精确），再用 **setShape** 把
+     "可见区域 + 可接收鼠标的区域"裁成只有球带那一条。
+     实测这条组合的结果：
+       X 几何 1924×996 @0,34           ← 位置准
+       Window shape extents: ...x167+...  ← 只剩底部 167px 高的一条
+     于是：位置准 + 不再挡住整个桌面。
+
+     ⚠ 为什么必须用 setShape 而不是 setInputRegion：
+       Electron 43.7.7 **没有 setInputRegion**（实测 typeof 为 undefined），
+       原来那段 `if (typeof w.setInputRegion === 'function')` 的分支
+       从来没执行过 —— 等于 overlay 一直在拦截整个桌面的点击。
+       setShape 同时裁剪绘制与输入，是当前版本唯一可用的工具。
+       代价：球要"上探/展开卡片"时必须同步更新 shape（见 syncShape()）。 */
   const OVERLAY = process.platform === 'linux' && !state.opaque;
   const shift = Math.round((c.offset || 0) + (state.dragShift || 0));
 
@@ -376,9 +483,9 @@ function anchors() {
     cardTop = Math.round(cardBottom - cardH);
   }
 
-  // dock 的水平范围（窗口内坐标）：laneAt / hitAt 的横向门禁。
-  // overlay 模式下窗口铺满工作区，热带不能再横贯全宽（否则整条底部
-  // 都会拦鼠标），必须收窄到球列真实占用的那一段。
+  /* dock 的水平范围（窗口内坐标）：laneAt / hitAt 的横向门禁。
+     满宽条模式下窗口 = 整个工作区宽度，所以球的水平偏移完全由页面内
+     --dock-shift 表达，窗口 x 永远不动（也就不会触发 mutter 重排）。 */
   let dockL;
   if (OVERLAY && c.dock === 'bottom-right') dockL = winW - 12 - dockW + shift;
   else if (OVERLAY && c.dock === 'bottom-left') dockL = 12 + shift;
@@ -391,7 +498,9 @@ function anchors() {
 
   /* input region（窗口内矩形，X Shape 用）：静止态只有这一块能接收鼠标。
      横向 = 球列 ± 8px 余量；纵向 = 球带（球本体 + 上探余量）。
-     没有它，overlay 会把整个工作区的点击全部吃掉 —— 用户点桌面任何地方都没反应。
+     ⚠ 满宽条本身就只覆盖球带那一条（不像 overlay 铺满整个桌面），
+       所以即便 shape 完全失效，也只会拦住屏幕底部那 100 多像素，
+       不会"点桌面任何地方都没反应"。
      ⚠ 纵向不能只用"球本体 30px"：悬停时球要上探 LIFT，而切 hot 的那一瞬间
        指针可能已经在球的上半部分，收窄的区域会让 pointerdown 打在窗外。 */
   const regL = Math.round(dockL - 8);
@@ -403,6 +512,7 @@ function anchors() {
     height: Math.max(1, Math.round(winH - Math.max(0, regT))),
   };
 
+  state.overlayMode = OVERLAY;
   return {
     win: { x: winX, y: winY, width: winW, height: winH },
     bands: {
@@ -423,6 +533,10 @@ function anchors() {
   };
 }
 
+/* lane 的唯一写入者是 pollHit（Linux）——见 onPage('hover') 处那段注释。
+   这里保留给 click / context / dragstart / 右键菜单回调这类"非指针驱动"的
+   一次性切换：它们确实需要立刻改 shape（比如菜单弹出时必须让卡片区可点），
+   但下一帧 pollHit 会按真实指针位置重新收拢，所以不会打架。 */
 function setLane(l) {
   if (l === state.lane) return;
   state.lane = l;
@@ -481,21 +595,189 @@ const POLL_MS = 32;
 let pollTimer = null;
 let pollStale = 0;
 
+/* ── 从 X 读指针位置（常驻子进程） ────────────────────────────
+   ⚠⚠ 为什么不能用 screen.getCursorScreenPoint()：**它在 XWayland 下是死的**。
+   实测同一台机器（Electron 43.7.7 + ozone=x11 + GNOME Wayland 宿主）：
+
+       X 侧 XQueryPointer  → 700,500        （XTEST 把指针搬过去了）
+       Electron EPTR       → 345,259        （纹丝不动）
+       再搬到 400,300
+       X 侧 XQueryPointer  → 400,300
+       Electron EPTR       → 345,259        （还是不变）
+
+   也就是说：窗口在、球画出来了、日志干净，但鼠标压上去毫无反应，
+   因为主进程拿到的光标位置永远是启动时那一个点。
+   整个 overlay 悬停机制都建在这个 API 上，所以它一失效，交互全废。
+
+   修法：指针位置从 **X 侧**读（XQueryPointer 才是真实位置）。
+   为了不每帧 fork（python 启动 ~35ms 比 32ms 轮询周期还长），
+   做成**常驻进程**：stdin 写一行 → stdout 回一行 JSON，往返 < 1ms。
+   见 src/pointer.py。
+
+   ⚠ 坐标单位：XQueryPointer 返回**物理像素**，而窗口几何是 DIP。
+     必须除以 scaleFactor 才能和 lastRect 相减。 */
+const pointer = {
+  proc: null,
+  py: null,
+  dead: false,
+  last: null,
+  pending: false,
+  diagLogged: false,
+};
+
+function startPointer() {
+  if (process.platform !== 'linux' || pointer.proc || pointer.dead) return;
+  const script = path.join(__dirname, '..', 'src', 'pointer.py');
+  if (!fs.existsSync(script)) { log('pointer.py 缺失，读不到 X 指针'); pointer.dead = true; return; }
+  for (const py of pythonCandidates()) {
+    try {
+      const p = require('child_process').spawn(py, [script], {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        env: process.env,
+      });
+      p.on('error', () => {});
+      p.stdout.setEncoding('utf8');
+      let buf = '';
+      p.stdout.on('data', (d) => {
+        buf += d;
+        let i;
+        while ((i = buf.indexOf('\n')) >= 0) {
+          const line = buf.slice(0, i).trim();
+          buf = buf.slice(i + 1);
+          if (!line) continue;
+          try {
+            const r = JSON.parse(line);
+            if (r && r.ok) {
+              pointer.last = { x: r.x, y: r.y, at: Date.now(), phys: true };
+            }
+          } catch (_) {}
+        }
+      });
+      p.stderr.on('data', () => {});
+      p.on('exit', () => { pointer.proc = null; });
+      pointer.proc = p;
+      pointer.py = py;
+      log('指针读取器已启动（XQueryPointer，常驻）:', py);
+      return;
+    } catch (_) {}
+  }
+  pointer.dead = true;
+  log('⚠ 指针读取器启动失败 —— 悬停将不可用（screen.getCursorScreenPoint 在 XWayland 下无效）');
+}
+
+function stopPointer() {
+  if (!pointer.proc) return;
+  try { pointer.proc.stdin.end(); } catch (_) {}
+  try { pointer.proc.kill(); } catch (_) {}
+  pointer.proc = null;
+}
+
+/* 请求一次指针位置（异步：写一行 stdin，结果落在 pointer.last）。
+   ⚠ 不要在这里等回包（会阻塞事件循环），轮询本来就是 32ms 一次，
+     拿到的是"上一帧请求的结果"，延迟一帧完全可以接受。
+
+   ⚠ pending 用**时间窗**而不是"收到回包才清"：
+     初版靠 stdout 回包清标记，一旦某次回包丢了（进程刚起、管道缓冲、
+     kill 竞态），pending 就永久为 true，**指针读取从此彻底停摆**，
+     而日志上什么都看不出来 —— 表现就是"悬停完全不响应"。
+     现在标记只挡 8ms，最长 8ms 后必然放行下一条请求。 */
+function requestPointer() {
+  if (!pointer.proc) { startPointer(); return; }
+  if (pointer.pending) return;
+  try {
+    pointer.proc.stdin.write('q\n');
+    pointer.pending = true;
+    setTimeout(() => { pointer.pending = false; }, 8);
+  } catch (_) {
+    pointer.proc = null;
+    pointer.pending = false;
+  }
+}
+
+/* 当前指针的屏幕坐标（**DIP**）。优先用 X 的路，拿不到才退回 Electron。 */
+function cursorScreen() {
+  if (process.platform === 'linux' && pointer.last) {
+    const sf = (() => {
+      try { return screen.getPrimaryDisplay().scaleFactor || 1; } catch (_) { return 1; }
+    })();
+    return { x: Math.round(pointer.last.x / sf), y: Math.round(pointer.last.y / sf), src: 'x' };
+  }
+  try {
+    const p = screen.getCursorScreenPoint();
+    return { x: p.x, y: p.y, src: 'electron' };
+  } catch (_) {
+    return null;
+  }
+}
+
+/* 指针在窗口内的坐标。
+   ⚠ 窗口原点必须用 **X 报告的真实几何**（state.lastRect，由 place() 刷新），
+     不能用 getBounds()，更不能用自己记的请求值。实测两条都会错：
+       · 请求值 936,960  → X 实际 1070,949  （mutter 重定位）
+       · getBounds 935,967 / 49x51 → X 实际 79x81（Chromium 把 content/frame 混了）
+     偏差大到这种程度时，指针明明压在球上，算出来的坐标却在窗外：
+     hitIdx 恒 -1、lane 恒 IDLE，30fps 每帧在 hot/idle 之间翻，
+     日志里是十几条/秒的抖动，而球永不亮起、点击穿透判定也全乱。 */
+let geomRefreshAt = 0;
 function cursorInWin() {
   if (!state.win || state.win.isDestroyed()) return null;
-  const p = screen.getCursorScreenPoint();
-  const r = state.lastRect || state.win.getBounds();
-  return { x: p.x - r.x, y: p.y - r.y, screen: p, rect: r };
+  const p = cursorScreen();
+  if (!p) return null;
+  const now = Date.now();
+  /* 兜底：万一 place() 还没跑过（首帧前），先拿 getBounds 顶上。
+     ⚠ 只在 lastRect 为空时用 getBounds —— 它含偏差，
+       长期拿它当基准指针判定会偏 9~10px。 */
+  if (!state.lastRect || now - geomRefreshAt > 5000) {
+    geomRefreshAt = now;
+    if (!state.lastRect) {
+      try { state.lastRect = state.win.getBounds(); } catch (_) { return null; }
+    }
+  }
+  const r = state.lastRect;
+  return { x: p.x - r.x, y: p.y - r.y, screen: p, rect: r, src: p.src };
 }
 
 function pollHit() {
-  if (!state.win || state.win.isDestroyed() || !state.repos.length) return;
+  if (!state.win || state.win.isDestroyed() || !state.repos.length) {
+    if (pollStale++ < 2) {
+      log('poll 跳过: win=' + !!state.win, 'destroyed=' + (state.win ? state.win.isDestroyed() : 'n/a'),
+        'repos=' + state.repos.length);
+    }
+    return;
+  }
   const c = cursorInWin();
-  if (!c) return;
+  if (!c) { if (pollStale++ < 2) log('poll 跳过: cursorInWin 返回 null'); return; }
   const a = anchors();
   const inside = c.x >= 0 && c.y >= 0 && c.x <= a.win.width && c.y <= a.win.height;
   const idx = inside ? hitAt(c.x, c.y) : -1;
-  const lane = inside ? laneAt(c.x, c.y) : LANE_IDLE;
+  /* 诊断：前几次轮询把光标与窗口的相对坐标打出来，能立刻看出坐标系对不对 */
+  /* 诊断：只在 idx 变化时打一条，避免 32ms 刷屏。
+     ⚠ 之前的写法是"前 8 次都打"，结果诊断全用在指针移动之前，
+     warp 之后的判定一条都没记录下来 —— 等于白打。 */
+  if (idx !== state.diagIdx) {
+    state.diagIdx = idx;
+    log('cursor', c.x + ',' + c.y, 'win', a.win.width + 'x' + a.win.height,
+      'rect', JSON.stringify(state.lastRect), 'inside', inside, 'idx', idx,
+      'dock', JSON.stringify(a.bands.dock));
+  }
+  /* ⚠⚠ lane 必须与 idx **同源**，这里踩过一个自激振荡，值得记下来：
+
+     原来写的是  lane = laneAt(c.x, c.y)，而 laneAt 的判据比 hitAt 宽松得多
+     （laneAt：球列 ±8px、纵向整条 hot 带；hitAt：球心 ±(D/2+5)、纵向含上探余量）。
+     于是出现 "lane=HOT 但 idx=-1" 的状态：
+       lane=HOT → applyInputShape 把 input region 放大到整窗
+                → 指针瞬间落在"窗口内但不在球上"的位置
+                → 浏览器发现指针离开了原来的元素 → pointerleave 冒出来
+                → 页面 post('hover',{index:-1})，而页面里的 driverHot 保护
+                  只在 __orbsHover 被调用过之后才生效；idx=-1 时这个函数
+                  **没被调用**，保护形同虚设 → 页面自己把 hot 撤了
+                → setLane(IDLE) 收窄 shape → 指针又回到球带 → lane=HOT …
+     30fps 下就是日志里那种十几条/秒的 "lane → hot"/"lane → idle" 抖动，
+     球反复闪、点击穿透判定也跟着乱。
+     把 lane 绑定到 idx 之后，"进了球才算 HOT"，振荡的回路被切断。 */
+  const lane = inside && idx >= 0 ? LANE_HOT
+    : (inside && cfg().showCard && c.y >= a.bands.card.top - 2 && c.y <= a.bands.card.bottom + 2)
+      ? LANE_CARD : LANE_IDLE;
   const pr = state.win.webContents;
   if (!pr || pr.isDestroyed()) return;
 
@@ -509,47 +791,151 @@ function pollHit() {
     send({ type: 'hover', index: idx });
   }
   // ② 输入区域：球上要能被点，别处要能穿透下层（Linux 靠 input shape 精确圈定）
-  const wantIgnore = lane === LANE_IDLE;
-  if (wantIgnore !== state.ignoring) {
-    state.ignoring = wantIgnore;
+  /* ⚠ 判据用 **lane** 而不是 ignoring：ignoring 是给 setIgnoreMouseEvents 记账的，
+     而 Linux 上那条路根本不走（见 applyInputShape）。用 ignoring 判断会出现
+     "lane 变了但 ignoring 没变 → 不刷新 shape" → 球上探的那一截被裁掉。
+     现在 lane 是唯一入口：变了才重算 shape。 */
+  if (lane !== state.lane) {
     state.lane = lane;
+    state.ignoring = lane === LANE_IDLE;
     applyInputShape(lane);
-    log('poll lane →', lane, 'idx', idx, 'ignore', wantIgnore);
-    pushProbe();
-  } else if (lane !== state.lane) {
-    state.lane = lane;
+    log('poll lane →', lane, 'idx', idx, 'ignore', state.ignoring);
     pushProbe();
   }
 }
 
-/* 把"哪里能接收鼠标"同步给窗口。
-   Linux 走 Electron 原生的 setInputRegion（X11 input shape），
-   非 Linux 走 setIgnoreMouseEvents（macOS/Windows 支持 forward，没有 shape 问题）。
+/* ── 用 setShape 把"可见 + 可点击"的区域裁成球带那一条 ──
 
-   ⚠ 这里**只允许"整窗接收"与"球带接收"两态，绝不允许"整窗穿透"**。
-     踩过的坑：页面里还留着 pointerleave/pointermove 监听（非 overlay 平台要用），
-     一旦把 input region 清空，窗口边缘穿过指针会立刻产生 pointerleave，
-     页面就 post('hover',{index:-1}) 把 hot 撤掉 —— 球刚亮起来就自己灭，
-     主进程随后又把它点亮，来回抖。日志里表现为
-       poll lane → hot idx 1 ignore false
-       lane → idle      ← 页面自己退的
-       lane → hot
-     所以 idle 态的 input region 始终保留球带矩形（球带本来就不挡下层），
-     "不挡下层"由球带之外的区域天然缺失保证，不靠清空整个 region。 */
+   ⚠⚠ 两个必须记住的事实：
+
+   ① **Electron 43.7.7 没有 setInputRegion**（实测 typeof 为 undefined）。
+      原代码写的是 `if (typeof w.setInputRegion === 'function') { ... }`，
+      分支从来没执行过 —— 也就是 overlay 一直在拦截整个桌面的点击，
+      而日志干净、无异常，属于最难发现的一类 bug。
+      现在显式探测并打印，缺了就走 setShape。
+
+   ② **setShape 同时裁剪绘制与输入**（X Shape 的 bounding + input 两套）。
+      实测生效：xwininfo -shape 报
+        Window shape extents: 2220x167+0+1041
+      即只剩底部一条，桌面其余部分完全穿透。
+
+   代价：球"上探 / 弹卡片"时可见区域变大，shape 必须同步放大，
+   否则上探的那一截和卡片会被裁掉（看起来像"球悬停后消失"）。
+   所以 shape 按当前 lane 取：
+     IDLE → 只有球带（最严格，桌面完全不被打扰）
+     HOT/CARD → 球带上探段 + 卡片段（够球和卡片用，仍不覆盖整个桌面）
+
+   ⚠ 不要用"整窗 shape = null"来图省事：overlay 铺满工作区时，
+     那等于把一个透明窗口盖在整个桌面上，点击全被吃掉。 */
+let shapeLogged = false;
+function syncShape(lane) {
+  if (!state.win || state.win.isDestroyed()) return;
+  const w = state.win;
+  if (process.platform !== 'linux') return;
+  if (!state.overlayMode) {
+    /* 非 overlay（没有合成器时的降级小窗）：窗口本来就只占球带，
+       不需要 shape。但若 Electron 有 setInputRegion 就用它。 */
+    try {
+      if (typeof w.setInputRegion === 'function') w.setInputRegion(anchors().region);
+    } catch (_) {}
+    return;
+  }
+  const a = anchors();
+  const idle = lane === LANE_IDLE;
+  /* 矩形一律按"窗口内坐标"给，且必须夹在窗口范围内 ——
+     setShape 传越界矩形在部分版本上会整块失效（表现为什么都不显示）。 */
+  const clamp = (x, y, ww, hh) => ({
+    x: Math.max(0, Math.round(x)),
+    y: Math.max(0, Math.round(y)),
+    width: Math.max(1, Math.round(ww)),
+    height: Math.max(1, Math.round(hh)),
+  });
+  const bands = a.bands;
+  /* ⚠⚠⚠ setShape 的 Rect 是**物理像素**，不是 DIP —— 这是本轮最贵的一课。
+
+     实测链条（球亮一下就灭、指针被"弹开"）：
+       球带 in DIP（窗口内）      y = 824 .. 854
+       换算到屏幕物理            y = 983 .. 1018   （窗口物理原点 y=31，scale=1.15625）
+       我传的 setShape 矩形       {y:797, h:57}     ← DIP
+       X 实际理解的覆盖范围       y = 828 .. 885    ← 直接当物理用
+     两者错位 155px：**shape 把球本身裁在了外面**。
+
+     视觉上看不出来（裁掉的区域本来就透明），但指针一旦压到球上，
+     它就落在"窗口 shape 之外"的位置 —— X 认为指针下面是桌面的空白，
+     于是把指针弹走（实测弹到 (784,487)），主进程下一次轮询读到
+     idx=-1 → 卡片收回 → 球落回。表现就是"悬停闪一下就没了"。
+
+     对照实验（同一台机器，不启动 Electron）：纯 XTEST warp 到 (961,1009)，
+     2.5 秒内指针纹丝不动 —— 证明搬走指针的是我们自己的 setShape。
+
+     所以这里必须乘 scaleFactor。用 X 报告的真实窗口原点不方便（它是屏幕
+     坐标，而 shape 要的是窗口内坐标），直接用 Electron 的 scaleFactor 即可：
+     窗口内 DIP × scaleFactor = 窗口内物理。 */
+  const sf = (() => {
+    try { return screen.getPrimaryDisplay().scaleFactor || 1; } catch (_) { return 1; }
+  })();
+  const rects = [];
+  let topDip;
+  if (idle) {
+    /* 静止态：只留球带（球本体 + 上探余量用满，避免刚命中时被裁） */
+    topDip = Math.max(0, bands.hot.top);
+  } else {
+    /* 交互态：球带上探段 + 卡片段。两段分别给，别合并成一大块。 */
+    topDip = Math.max(0, Math.min(bands.hot.top, bands.card.top));
+  }
+  /* 先把 DIP 矩形算好，再整体换算到物理。宽度/高度也要乘 —— 只乘位置不乘尺寸
+     会得到一条"位置对了但高度不够"的窄带，球的下半部分照样被裁。 */
+  const dipRect = {
+    x: 0,
+    y: topDip,
+    width: a.win.width,
+    height: a.win.height - topDip,
+  };
+  const physRect = {
+    x: Math.round(dipRect.x * sf),
+    y: Math.round(dipRect.y * sf),
+    width: Math.round(dipRect.width * sf),
+    height: Math.round(dipRect.height * sf),
+  };
+  rects.push(clamp(physRect.x, physRect.y, physRect.width, physRect.height));
+  try {
+    if (typeof w.setShape === 'function') {
+      w.setShape(rects);
+      if (!shapeLogged) {
+        shapeLogged = true;
+        log('setShape 生效（物理像素）: ' + JSON.stringify(rects) +
+          ' | DIP: ' + JSON.stringify(dipRect) + ' | scale ' + sf);
+      }
+    } else if (typeof w.setInputRegion === 'function') {
+      w.setInputRegion(a.region);
+    } else if (!shapeLogged) {
+      shapeLogged = true;
+      log('⚠ 既没有 setShape 也没有 setInputRegion —— overlay 会挡住整个桌面的点击');
+    }
+  } catch (e) {
+    log('syncShape:', e.message);
+  }
+}
+
+/* 兼容旧名字：内部若干处仍调 applyInputShape。
+   Linux/overlay 走 syncShape；其它平台走 setIgnoreMouseEvents。 */
 function applyInputShape(lane) {
   if (!state.win || state.win.isDestroyed()) return;
   const w = state.win;
+  if (process.platform === 'linux') {
+    /* ⚠ Linux 上**永远不要**开 setIgnoreMouseEvents(true)：
+       X11 下它是靠把 window 的 input shape 置空实现的，
+       而 shape 为空时指针事件根本不会投递到窗口，
+       主进程 30fps 轮询虽然还能判定"指针在球上"，
+       但 pointerdown 会打在窗外 → 点击永远失效。
+       穿透完全交给 syncShape 的矩形裁剪。 */
+    try { w.setIgnoreMouseEvents(false); } catch (_) {}
+    syncShape(lane);
+    return;
+  }
   const idle = lane === LANE_IDLE;
   try {
-    if (process.platform === 'linux') {
-      // ignore 恒为 false：靠 input shape 精确圈定可交互区域，比 ignore 更细。
-      w.setIgnoreMouseEvents(false);
-      if (typeof w.setInputRegion === 'function') {
-        w.setInputRegion(idle ? anchors().region : null);
-      }
-    } else {
-      w.setIgnoreMouseEvents(idle, idle ? { forward: true } : undefined);
-    }
+    w.setIgnoreMouseEvents(idle, idle ? { forward: true } : undefined);
   } catch (e) {
     log('applyInputShape:', e.message);
   }
@@ -557,14 +943,26 @@ function applyInputShape(lane) {
 
 function startPoll() {
   if (pollTimer || process.platform !== 'linux') return;
+  startPointer();
   pollTimer = setInterval(() => {
     try {
+      requestPointer(); // 先发请求，本次用上一次的结果（延迟一帧，可接受）
       pollHit();
     } catch (e) {
       if (pollStale++ < 3) log('poll error:', e.message);
     }
   }, POLL_MS);
-  if (pollTimer.unref) pollTimer.unref();
+  /* ⚠⚠ 绝不能对 pollTimer 调 unref()。这是本轮排查里最阴的一个：
+     unref() 的语义是"这个定时器不该让 Node 进程保持存活"，
+     而 Electron 主进程的事件循环在"没有任何 ref 定时器"时，
+     会把这段时间当成可睡眠窗口 —— 定时器被无限期延后，
+     **pollHit 一次都不会跑**。
+     症状极具误导性：窗口在、球画出来了、page probe 正常、
+     日志干净，只是"悬停完全没反应、点击也没反应"，
+     而且每隔很久可能突然跑一次（有其他事件把它唤醒时），
+     看起来像"偶发失灵"。
+     overlay 模式完全依赖这个轮询（页面收不到 pointer 事件时要靠它判悬停），
+     所以它必须保持 ref 状态。进程退出由 app.quit / 窗口关闭负责。 */
 }
 
 function stopPoll() {
@@ -580,21 +978,42 @@ function stopPoll() {
 function hitAt(px, py) {
   const a = anchors();
   const c = cfg();
-  if (laneAt(px, py) !== LANE_HOT) return -1;
+  /* ⚠⚠ 这里不能一上来就 `if (laneAt(px,py) !== HOT) return -1;`。
+     踩过的坑（表现为"悬停闪一下就没了"）：
+       指针压在球上 → idx=0 → lane=HOT → 卡片弹出、球上探（transform 抬 lift）
+       → 球的视觉位置变了 → 指针相对**新**球位已经"不在球上"
+       → hitAt 返回 -1 → lane=IDLE → 卡片收起、球落回
+       → 指针又压在球上 → ……
+     30fps 下每秒来回十几次，卡片一闪一闪。
+     并且卡片本身也在球上方，指针若在卡片上，也应该维持 hot（否则卡片
+     刚弹出来就把自己关掉）。
+
+     对策：命中判定用**静止态球位**（不随 hot 的 transform 变），
+     并且把卡片带也算作 hot 的延续。这样指针只要还在"球 + 上探区"或
+     "卡片区"里，hot 就稳定。 */
   const m = a.metrics;
-  const padBottom = 3;
   const lift = cfg().size * 0.62;
   const dockLeft = a.bands.dock.left;
   const isTop = c.dock === 'top';
-  // 球位（窗口内坐标，未下沉）：bottom 停靠时球贴在窗口底边上方 dockH 那一条里
-  const orbTop = isTop ? 0 : m.winH - m.dockH;
+  /* 静止态的球位：球贴在窗口底边上方 dockH 那一条里。
+     注意**不用 m.winH - m.dockH 这种随窗口变化的量**，
+     而是直接用 bands.dock（它由 anchors 按 dockH 算出，与 hot 无关）。 */
+  const orbTop = isTop ? a.bands.dock.top : a.bands.dock.bottom - c.size;
   const orbBottom = orbTop + c.size;
+  const cy = (orbTop + orbBottom) / 2;
+  const halfH = c.size / 2 + lift + 6; // 球本体 + 上探余量 + 手指容差
+
+  // 卡片带：指针在卡片里也算还在这个球上
+  const inCard = cfg().showCard &&
+    py >= a.bands.card.top - 4 && py <= a.bands.card.bottom + 4 &&
+    px >= dockLeft - 12 && px <= dockLeft + m.dockW + 12;
+
   for (let i = 0; i < state.repos.length; i++) {
     const cx = dockLeft + i * (c.size + c.gap) + c.size / 2;
-    const cy = (orbTop + orbBottom) / 2;
-    // 命中框：球本体 + 上探余量（悬停时球会抬起 lift）
-    const halfH = (orbBottom - orbTop) / 2 + m.lift;
-    if (Math.abs(px - cx) <= c.size / 2 + 5 && Math.abs(py - cy) <= halfH) return i;
+    const dx = Math.abs(px - cx);
+    const dy = Math.abs(py - cy);
+    if (dx <= c.size / 2 + 6 && dy <= halfH) return i;
+    if (inCard && dx <= c.size / 2 + 20) return i;
   }
   return -1;
 }
@@ -632,14 +1051,57 @@ function hitAt(px, py) {
    但它是**真的能看见的** —— 比一个完美的透明球但看不见强得多。 */
 function detectCompositor() {
   if (process.platform !== 'linux') return true;
+  /* ⚠⚠ 这里改过一次判据，原来的判据是**错的**，代价是球彻底看不见。
+
+     原判据：xprop -root _NET_WM_CM_S0 有值 → 有合成器
+     问题：**XWayland 下这个属性永远 not found**。合成器跑在 Wayland 侧
+           （mutter 就是 Wayland 合成器），它根本不需要给 XWayland 注册这个选区。
+           于是判据恒为 false → 走不透明降级 → 不再用 overlay 模式 →
+           退回"48px 小窗"形态 → 被 mutter 重排到偏 145px 的地方 →
+           看起来像"球没出现/球跑偏了"。
+
+     正确判据：**看 X 是否提供 32 位 ARGB visual**。透明窗口必须建立在
+       depth=32 的 visual 上；合成器在场时 XWayland 一定会导出 ARGB visual。
+       实测本机：`xwininfo -id <窗口>` 报 Depth: 32 —— 透明窗口创建成功，
+       说明合成器一直在，只是 _NET_WM_CM_S0 不认。
+     辅助判据：GNOME Shell 在跑（_NET_SUPPORTING_WM_CHECK）也说明有合成器
+       （mutter 是自合成 WM，Wayland 侧统一合成）。
+
+     ⚠ 另外必须知道：overlay（铺满工作区）不只是"为了不依赖定位"，
+       它是**唯一位置准确的形态**。实测同一份代码：
+         铺满工作区 1920×987 @0,31  →  X 1924×996 @0,34   偏差 (+0,+3)  ✅
+         小窗 48×58 @936,949        →  X 65×77  @1081,941  偏差 (+145,-8) ❌
+       mutter 只重排"小窗口"（防越界/避让），对铺满工作区的窗口它不动。
+       所以**透明 + overlay 是正确路线**，不透明降级只是没有合成器时的兜底。 */
   try {
     const xt = require('child_process');
-    const out = xt.execFileSync('xprop', ['-root', '_NET_WM_CM_S0'], {
-      encoding: 'utf8', timeout: 3000, env: process.env,
-    });
-    const has = /=/.test(out) && !/not found/i.test(out);
-    log('合成器探测: _NET_WM_CM_S0 ' + (has ? '存在（可用透明窗口）' : '不存在（将降级为不透明窗口）'),
-      '[' + (out || '').trim().slice(0, 80) + ']');
+    const argb = (() => {
+      try {
+        const out = xt.execFileSync('xprop', ['-root', '_NET_SUPPORTED'], {
+          encoding: 'utf8', timeout: 3000, env: process.env,
+        });
+        return /_NET_WM_WINDOW_OPACITY|32_BIT_VISUAL|ARGB/i.test(out);
+      } catch (_) { return false; }
+    })();
+    let cmSel = '';
+    try {
+      cmSel = xt.execFileSync('xprop', ['-root', '_NET_WM_CM_S0'], {
+        encoding: 'utf8', timeout: 3000, env: process.env,
+      });
+    } catch (_) {}
+    const cmSelHas = /=/.test(cmSel) && !/not found/i.test(cmSel);
+    let wmName = '';
+    try {
+      wmName = xt.execFileSync('xprop', ['-root', '_NET_SUPPORTING_WM_CHECK'], {
+        encoding: 'utf8', timeout: 3000, env: process.env,
+      });
+    } catch (_) {}
+    const wmHas = /window id #|#\s*0x|=/.test(wmName) && !/not found/i.test(wmName);
+    const has = cmSelHas || argb || wmHas;
+    log('合成器探测: _NET_WM_CM_S0=' + (cmSelHas ? '有' : '无') +
+      ' ARGB集=' + (argb ? '有' : '无') + ' WM=' + (wmHas ? '在' : '无') +
+      ' → ' + (has ? '判定有合成器（用透明 + overlay，这是位置最准的形态）'
+        : '判定无合成器（降级为不透明小窗）'));
     return has;
   } catch (e) {
     log('合成器探测失败，按"无合成器"处理（宁可丑，也要看得见）:', e.message);
@@ -830,14 +1292,17 @@ function probePixels() {
 /* ───────────────────────── 窗口 ───────────────────────── */
 
 function createWindow() {
-  const a = anchors();
+  const a = anchors(); // 顺带写入 state.overlayMode
+  const gpad = state.overlayMode ? { w: 0, h: 0, x: 0, y: 0 } : GEOM_PAD;
   log('createWindow', JSON.stringify(a.win), 'wa', JSON.stringify(a.workArea),
     'view', JSON.stringify(state.view), 'opaque', state.opaque);
   const win = new BrowserWindow({
-    x: a.win.x,
-    y: a.win.y,
-    width: a.win.width,
-    height: a.win.height,
+    /* ⚠ 构造期也要扣掉 XWayland 的小窗偏差（GEOM_PAD），否则首帧位置就偏。
+       overlay 形态（铺满工作区）不需要补偿，gpad 已按形态取零。 */
+    x: a.win.x - gpad.x,
+    y: a.win.y - gpad.y,
+    width: Math.max(MIN_WIN_W, a.win.width - gpad.w),
+    height: Math.max(MIN_WIN_H, a.win.height - gpad.h),
     frame: false,
     /* ⚠ 透明与否是**构造期**选项，创建后不能改。
        没有合成器时 transparent:true 会导致窗口 map 失败（屏幕空白），
@@ -1017,6 +1482,23 @@ function createWindow() {
     try {
       log('after show: visible=' + win.isVisible() + ' bounds=' + JSON.stringify(win.getBounds()));
     } catch (_) {}
+    /* 初始化指针换算基准。用 anchors() 算出的**目标位置**（a.win），
+       而不是 X 读回值 —— 读回值含 GEOM_PAD 那部分偏差（窗口实际比需求大
+       9×10px），拿它当基准，指针在球右侧 9px 内会被判成"在球上"。
+       这里仍然打印一次 X 真实几何，纯粹为了发现"平台选错/被 WM 大挪"这类异常。 */
+    state.lastRect = { x: a.win.x, y: a.win.y, width: a.win.width, height: a.win.height };
+    const real = realGeomFromX();
+    if (real) {
+      log('X 真实几何: ' + JSON.stringify(real));
+      const dx = Math.abs(real.x - a.win.x);
+      const dy = Math.abs(real.y - a.win.y);
+      if (dx > 6 || dy > 6) {
+        log('⚠ 窗口实际位置与目标差 (' + dx + ',' + dy + ') —— 若持续偏移，' +
+            '多半是 ozone 平台或 WM 策略问题（本次按目标位置做指针换算）');
+      }
+    } else {
+      log('⚠ 读不到 X 真实几何（handle 为 0x1 说明 ozone 仍是 wayland）');
+    }
     verifyMapped();
   });
   win.on('closed', () => {
@@ -1032,22 +1514,105 @@ function createWindow() {
   return win;
 }
 
-/** 唯一的移动入口 —— setBounds 且每次显式带 w/h。setPosition 每调一次尺寸就涨 1~2px。 */
+/** 唯一的移动入口 —— setBounds 且每次显式带 w/h。setPosition 每调一次尺寸就涨 1~2px。
+
+    ⚠⚠ XWayland 下 Electron 的 getBounds() 与 X 实际几何**不一致**，实测：
+         after show: bounds={"x":935,"y":967,"width":49,"height":51}   ← Electron 说
+         xwininfo:   79x81+1070+949                                     ← X 实际
+       两个方向都错：(135, -18) 的位置偏差、+30 的尺寸偏差（Chromium 的
+       XWayland 路径把 content 尺寸和 frame 尺寸混了，且 mutter 会重定位）。
+       后果非常实在：拿 getBounds 算"指针相对窗口的坐标"，球明明在指针下面
+       也算不中，于是 hot 恒为 -1、球永不亮起 —— 看起来就是"球在那但没反应"。
+
+       所以：**以 X 为真理**。setBounds 之后用 xwininfo 读回真实几何，
+       存进 state.realRect，指针换算一律用它。读不到时退回 getBounds
+       （至少还能工作，只是可能有偏差）。 */
+function realGeomFromX() {
+  if (process.platform !== 'linux' || !state.win || state.win.isDestroyed()) return null;
+  try {
+    const { execFileSync } = require('child_process');
+    /* 只查自己这个窗口，比全树扫描快得多。
+       getNativeWindowHandle() 在**正确的 ozone=x11** 下返回真实 X window id；
+       在 ozone=wayland 时它恒为 0x1（非法），这里查不到就直接返回 null。 */
+    const buf = state.win.getNativeWindowHandle();
+    const id = '0x' + buf.readUInt32LE(0).toString(16);
+    if (id === '0x1') return null; // 占位窗口，说明 ozone 平台还是选错了
+    const out = execFileSync('xwininfo', ['-id', id], { encoding: 'utf8', timeout: 2000 });
+    const gx = /Absolute upper-left X:\s*(-?\d+)/.exec(out);
+    const gy = /Absolute upper-left Y:\s*(-?\d+)/.exec(out);
+    const gw = /Width:\s*(\d+)/.exec(out);
+    const gh = /Height:\s*(\d+)/.exec(out);
+    const mv = /Map State:\s*(\w+)/.exec(out);
+    if (!gx || !gy || !gw || !gh) return null;
+    return {
+      x: +gx[1], y: +gy[1], width: +gw[1], height: +gh[1],
+      mapped: !mv || mv[1] === 'IsViewable',
+      source: 'xwininfo',
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
+/* ── XWayland 几何偏差补偿 ──────────────────────────────────
+   ⚠ 实测结论（本机 Electron + ozone=x11 + mutter/XWayland，重复多次一致）：
+
+     形态                         请求                  X 实际              偏差
+     铺满工作区(overlay)     1920×987 @0,31       1924×996 @0,34      (+0,+3)  ✅
+     小窗                    48×58   @936,949     65×77   @1081,941   (+145,-8) ❌
+     小窗(居中)              48×58   @940,500     66×78   @1086,578   (+146,+78)❌
+     小窗(靠左上)            48×58   @100,100     66×79   @115,115    (+15,+15) ❌
+
+   规律：**mutter 会重排"小窗口"**（往工作区内推、避让边缘），窗口越小越靠边
+   推得越狠；而**铺满工作区的窗口它不动**（+3px 属于 client-side 装饰的尺度）。
+   所以正解不是"算补偿值"（它和小窗尺寸/位置都相关，算不准），
+   而是**走 overlay 形态**——顺带也彻底摆脱 setBounds 定位的不可靠。
+
+   下面这个 padding 只在"没有合成器、被迫用小窗"的降级路径里起作用：
+   实测小窗在 X 上总比请求大 17×19 左右，位置被推 +145，
+   那就反向扣掉，让降级形态至少能落在正确的地方（不完美但比偏 145px 强）。 */
+const GEOM_PAD = (() => {
+  if (process.platform !== 'linux' || process.env.BRANCH_ORBS_NO_GEOM_FIX) {
+    return { w: 0, h: 0, x: 0, y: 0 };
+  }
+  /* 小窗降级路径的经验值：X 会把窗口放大 ~17×19，并把位置往内推 ~145。 */
+  return { w: 17, h: 19, x: 145, y: 8 };
+})();
+
 function place(x, y, w, h) {
   if (!state.win || state.win.isDestroyed()) return;
-  const r = {
+  const want = {
     x: Math.round(x),
     y: Math.round(y),
     width: Math.max(MIN_WIN_W, Math.round(w)),
     height: Math.max(MIN_WIN_H, Math.round(h)),
   };
+  /* overlay 形态铺满工作区，不需要任何补偿
+     （mutter 不动铺满的窗口，实测偏差只有 +3px）。
+     直接看 state.overlayMode —— 由 anchors() 在每次计算时写入，
+     比在 place() 里再调一次 anchors() 便宜。 */
+  const pad = state.overlayMode ? { w: 0, h: 0, x: 0, y: 0 } : GEOM_PAD;
+  const req = {
+    x: want.x - pad.x,
+    y: want.y - pad.y,
+    width: Math.max(MIN_WIN_W, want.width - pad.w),
+    height: Math.max(MIN_WIN_H, want.height - pad.h),
+  };
   const b = state.win.getBounds();
-  if (b.x === r.x && b.y === r.y && b.width === r.width && b.height === r.height) return;
-  const prev = state.win.getBounds();
-  state.win.setBounds(r);
-  state.lastRect = r;
+  if (b.x === req.x && b.y === req.y && b.width === req.width && b.height === req.height) return;
+  state.win.setBounds(req);
   const now = state.win.getBounds();
-  if (process.env.BRANCH_ORBS_TRACE) log('place', JSON.stringify(r), 'prev', JSON.stringify(prev), 'now', JSON.stringify(now));
+  /* ⚠ 不要在这里读 xwininfo：place 被 scheduleRepaint 高频调用，
+     每次 fork 一个 xwininfo（~2ms）会把主线程拖住。
+     指针换算要的是"我们要求的屏幕位置"（want），它本身就是准的
+     （overlay 下 +3px 已经落在球半径的容差内）。 */
+  state.lastRect = want;
+  /* ⚠ shape 是"窗口内坐标的矩形"，窗口一变就必须重算 ——
+     否则窗口长大/缩小之后，裁剪区域还停在旧位置，球会被裁掉一半。 */
+  syncShape(state.lane || LANE_IDLE);
+  if (process.env.BRANCH_ORBS_TRACE) {
+    log('place want', JSON.stringify(want), 'req', JSON.stringify(req), 'now', JSON.stringify(now));
+  }
   pushProbe();
 }
 
@@ -1085,6 +1650,9 @@ function pushState() {
     cfg: c,
     shift: Math.round((c.offset || 0) + (state.dragShift || 0)),
     opaque: !!state.opaque,
+    /* Linux 上悬停判定永远归主进程（input shape 收窄后页面收不到 pointer 事件），
+       所以从一开始就告诉页面"别自己判"，否则两边的 pointerleave 会互相打架。 */
+    driverHot: process.platform === 'linux',
   });
 }
 /* ───────────────────────── 页面事件 ───────────────────────── */
@@ -1112,7 +1680,20 @@ function onPage(channel, m) {
   }
   if (channel === 'hover') {
     state.hot = typeof m.index === 'number' ? m.index : -1;
-    setLane(state.hot >= 0 ? LANE_HOT : LANE_IDLE);
+    /* ⚠⚠ Linux/overlay 下**不要**在这里改 lane。
+       踩过的坑（日志表现是 setLane 的 idle/hot 每隔几毫秒来回翻）：
+
+         页面 __orbsHover(1) → post('hover',{index:1})
+                            → 这里 setLane(HOT)
+         同时 pollHit 也在每 32ms 判一次，按 shape 需要写 state.lane
+       两个写入方交替覆盖 state.lane，setLane 的 `if (l === state.lane) return`
+       守卫只在"值没变"时挡住，挡不住这种交替写。
+       而 lane 的权威来源必须是 pollHit —— 只有它同时掌握
+       "指针在哪 + shape 该多大"这两件事（shape 要跟着指针走，
+       页面根本不知道指针在哪）。
+
+       所以 Linux 下这里只同步 state.hot，lane 交给 pollHit 的下一帧。 */
+    if (process.platform !== 'linux') setLane(state.hot >= 0 ? LANE_HOT : LANE_IDLE);
     send({ type: 'hover', index: state.hot });
     return;
   }

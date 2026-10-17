@@ -173,17 +173,48 @@ function launchArgs(root, opts) {
   const o = opts || {};
   const electron = o.electron || findElectron(root);
   if (!electron) return null;
-  /* ⚠ 不要把 Chromium 开关（--no-sandbox / --disable-dev-shm-usage /
-     --ozone-platform）放在命令行上！这个 Electron 构建会直接拒绝：
-       electron: bad option: --no-sandbox
-     进程秒退，扩展侧只看到"壳启动后立刻消失"。
-     这些开关统一在 shell/main.js 里用 app.commandLine.appendSwitch 设置
-     —— 那里一定生效，且不受 CLI 解析规则限制。
-     这里只负责：应用路径（顺序有意义）。 */
+  /* ⚠⚠ 这里是"球一直不出现"的**真正根因**，前面所有排查（合成器、
+     type、透明、GPU、尺寸下限）全是次要的。务必读完整：
+
+     `app.commandLine.appendSwitch('ozone-platform','x11')` 在 main.js 顶层调用
+     **不生效**。Ozone 平台的选择发生在 Chromium 初始化最早期（比 JS 入口更靠前，
+     在 electron_main_delegate 里就定死了），JS 里的 appendSwitch 只补进命令行的
+     尾部，此时平台已选定 —— 于是壳仍然跑在 **Wayland ozone 后端**上。
+
+     后果是一条非常隐蔽的假象链（实测）：
+       · Electron 认为自己一切正常：isVisible()=true、getBounds() 精确正确
+       · Wayland 侧窗口其实也画出来了，但那不是 X 窗口
+       · X11 里它只留一个占位窗口，id 恒为 **0x1**（不是合法 window）
+       · 日志里 XGetWindowAttributes failed for window 1
+       · getNativeWindowHandle() 返回 0x1 → xprop -id 0x1 报 BadWindow
+       · xwininfo -root -tree 里永远找不到那个 48×50 的窗口
+     也就是说：**球画在 Wayland 上了，而我们所有的 X 校验都在查一个不存在的窗口。**
+     （这也解释了为什么 python-xlib 建的同尺寸窗口能 map_state=2 —— 它是真 X 客户端。）
+
+     对策：把 --ozone-platform=x11 放到**命令行**上，由 Chromium 自己在最早期解析。
+     已实测对比：
+       仅 appendSwitch  → native handle = 0x1，X 树里无此窗口
+       命令行传参       → native handle = 0x2400004，xwininfo 可见 65x68，
+                          _NET_WM_WINDOW_TYPE_NORMAL，WM_STATE: Normal  ✅
+
+     ⚠ 为什么以前注释说"不能放命令行"：那时误判了 `electron: bad option: --no-sandbox`。
+       真相是 --no-sandbox 需要**在应用路径之后**（Chromium 会把它当应用参数），
+       而 --ozone-platform 这类标准 Chromium 开关放哪都行。root 下关沙箱另有
+       ELECTRON_DISABLE_SANDBOX 环境变量兜着（见 spawnEnv），不依赖命令行。 */
   const args = [];
   const bundled = path.join(root, 'shell', 'node_modules', 'electron', 'dist', 'electron');
   const isBundled = path.resolve(electron) === path.resolve(bundled);
   if (!isBundled) args.push(makeShimApp(root));
+  /* Chromium 开关必须在**应用路径之前**：
+     electron <开关...> <应用路径>
+     放到应用路径之后会被当成应用的 argv（Electron 会警告 unknown option）。 */
+  const flags = BASE_FLAGS[process.platform] || [];
+  if (process.env.BRANCH_ORBS_OZONE === 'wayland') {
+    // 显式要求 Wayland 时不给 x11（纯 Wayland 无 XWayland 的环境用）
+    args.push(...flags.filter((f) => !/^--ozone-platform/.test(f)));
+  } else {
+    args.push(...flags);
+  }
   args.push(path.join(root, 'shell'));
   if (o.extra) args.push(...o.extra);
 

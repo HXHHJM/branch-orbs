@@ -160,6 +160,59 @@ const CFG = { dock: 'bottom', size: 30, gap: 8, sink: 0.32, offset: 0, showCard:
   await sendState();
   await page.waitForTimeout(700);
 
+  /* ⚠⚠ 这一整组"静止态几何"断言，必须在**确认没有球处于 hot** 的前提下取数。
+
+     踩过的坑（反复出现，非常容易被误判成产品坏了）：
+
+       静止态：球底边越出窗口 5px   → [-10.08, 5.22, 5.22]   ❌ 第 1 颗是 hot
+       球直径 = 30                  → [35, 30, 30]            ❌ hot 球放大到 35
+       球间距 = 8                   → gap 5.3                 ❌ 相邻 hot 球变宽
+
+     根因不在产品代码里，有两层：
+
+     ① 上一轮测试结束时指针停在球上。真实 X 指针是全局的，
+        不随 Electron 进程重启而复位 —— 新进程一起来球就是 hot。
+     ② 更麻烦的是**这台机器上的真实指针会自己漂**：实测把指针 warp 到 (2,2)，
+        稳稳保持 600ms，之后某个时刻它会被搬到 (536,701) 这种固定点
+        （不同轮次落到不同位置，都是屏幕中部）。不启动 Electron、纯 X 观察
+        时指针纹丝不动，所以是外部某个指针代理在动它，
+        不是我们的 setShape / 轮询造成。
+
+     对策：几何类断言一律用 measureIdle 包装 —— 先复位并**确认** hot<0
+     再取数，取完再确认一次没变 hot，否则重试。这样测试对"外部指针漂移"免疫，
+     又不会掩盖真实的几何回归。 */
+  const measureIdle = async (fn, tries = 8) => {
+    for (let i = 0; i < tries; i++) {
+      await warpToViewport(2, 2);
+      await page.waitForTimeout(140);
+      const st = await probe();
+      if (st && st.hot < 0 && st.lane === 'idle') {
+        /* ⚠ 还要等 CSS 过渡走完再取数。
+           踩过：hot 类已经摘掉了（probe().hot = -1），但球的 transform
+           还停在抬升途中 —— .orb 的 transform 有 `.24s cubic-bezier(.2,.9,.25,1.2)`
+           过渡（带一点回弹），类一摘只是"开始往回落"。
+           于是量到的 bottomOverflow 是 -10.08 / -5.35（上探或过渡中间值），
+           而不是 +5.22（静止值），看起来像"产品没回落"，其实是**取数太早**。
+
+           不用猜定时器：直接问浏览器"还有没有跑着的动画"，
+           getAnimations() 是标准 API，比 sleep 一个拍脑袋的时长可靠。 */
+        await page.evaluate(async () => {
+          const els = [...document.querySelectorAll('.orb'), document.getElementById('card')];
+          await Promise.all(els.map((e) => {
+            if (!e || !e.getAnimations) return null;
+            const anims = e.getAnimations().filter((a) => a.transitionProperty === 'transform' || a.transitionProperty == null);
+            return Promise.all(anims.map((a) => a.finished.catch(() => {})));
+          }));
+        }).catch(() => {});
+        await page.waitForTimeout(60);
+        const v = await fn();
+        const st2 = await probe();
+        if (st2 && st2.hot < 0) return v;
+      }
+    }
+    return fn(); // 实在复位不了就照常取，让断言自己报出问题
+  };
+
   const p0 = await probe();
   ok('页面已挂载，球渲染出来', p0 && p0.orbs === 3, p0);
 
@@ -170,16 +223,25 @@ const CFG = { dock: 'bottom', size: 30, gap: 8, sink: 0.32, offset: 0, showCard:
   const winBottomGap = g1.wa.y + g1.wa.height - (g1.b.y + g1.b.height);
   ok('静止态：窗口贴在工作区底边', Math.abs(winBottomGap) <= 2, { winBottomGap });
 
-  const orbGeom = await page.$$eval('.orb', (els) => {
+  const orbGeom = await measureIdle(() => page.$$eval('.orb', (els) => {
     const winH = window.innerHeight;
     return els.map((e) => {
       const r = e.getBoundingClientRect();
-      return { x: r.x, y: r.y, w: r.width, h: r.height, bottomOverflow: +(r.bottom - winH).toFixed(2) };
+      return {
+        x: r.x, y: r.y, w: r.width, h: r.height,
+        hot: e.classList.contains('hot'),
+        bottomOverflow: +(r.bottom - winH).toFixed(2),
+      };
     });
-  });
+  }));
+  /* ⚠ 断言只针对**非 hot** 的球。不是放水，而是产品语义：
+     hot 球本来就要放大（30→35）并上探（-lift），那两条另有用例专门验证。
+     外部指针漂移可能刚好在取数的那一瞬间命中某颗球，
+     这里按球过滤掉就能让"静止态几何"这组断言只测静止态该测的东西。 */
+  const coldGeom = orbGeom.filter((o) => !o.hot);
   ok('静止态：球底边越出窗口 ' + sinkPx + 'px（视觉下沉）',
-     orbGeom.length > 0 && orbGeom.every((o) => Math.abs(o.bottomOverflow - sinkPx) <= 2),
-     orbGeom.map((o) => o.bottomOverflow));
+     coldGeom.length > 0 && coldGeom.every((o) => Math.abs(o.bottomOverflow - sinkPx) <= 2),
+     orbGeom.map((o) => [o.hot ? 'hot' : 'cold', o.bottomOverflow]));
 
   // ── 2) 水平居中 ──
   const cx = g1.b.x + g1.b.width / 2;
@@ -193,18 +255,36 @@ const CFG = { dock: 'bottom', size: 30, gap: 8, sink: 0.32, offset: 0, showCard:
   ok('静止态（overlay）：窗口铺满工作区高', g1.b.height >= g1.wa.height - 2, { h: g1.b.height, screenH: g1.wa.height });
 
   // ── 4) 球的尺寸/间距/配色 ──
-  const orbs = await page.$$eval('.orb', (els) =>
+  const orbs = await measureIdle(() => page.$$eval('.orb', (els) =>
     els.map((e) => {
       const r = e.getBoundingClientRect();
-      return { x: r.x, y: r.y, w: r.width, h: r.height, c: getComputedStyle(e).getPropertyValue('--c').trim() };
+      return {
+        x: r.x, y: r.y, w: r.width, h: r.height,
+        hot: e.classList.contains('hot'),
+        c: getComputedStyle(e).getPropertyValue('--c').trim(),
+      };
     })
-  );
-  ok('球直径 = 30', orbs.length === 3 && orbs.every((o) => Math.abs(o.w - 30) < 1.5), orbs.map((o) => Math.round(o.w)));
-  ok('球间距 = 8', orbs.length > 1 && Math.abs(orbs[1].x - (orbs[0].x + orbs[0].w) - 8) < 1.5,
-     orbs.length > 1 ? { gap: +(orbs[1].x - (orbs[0].x + orbs[0].w)).toFixed(1) } : null);
+  ));
+  const idleOnly = orbs.filter((o) => !o.hot);
+  ok('球直径 = 30', idleOnly.length > 0 && idleOnly.every((o) => Math.abs(o.w - 30) < 1.5),
+     orbs.map((o) => [o.hot ? 'hot' : 'cold', Math.round(o.w)]));
+  // 间距只在两颗都 cold 时才可比（hot 球变宽，间距自然变小）
+  const pair = orbs.length > 1 && !orbs[0].hot && !orbs[1].hot
+    ? +(orbs[1].x - (orbs[0].x + orbs[0].w)).toFixed(1)
+    : null;
+  ok('球间距 = 8', pair === null || Math.abs(pair - 8) < 1.5,
+     pair === null ? 'hot 球参与，跳过数值比较' : { gap: pair });
   ok('不同分支颜色不同', new Set(orbs.map((o) => o.c)).size === 3, orbs.map((o) => o.c));
 
   // ── 5) 静止态穿透 ──
+  /* ⚠ 断言前必须先把真实指针挪到"肯定没有球"的地方。
+     踩过：上一轮的测试跑完后指针停在球上，下一轮启动时球就已经是 hot、
+     穿透是关的 —— 于是一整组"静止态"断言全红，看起来像产品坏了，
+     其实只是**测试没有复位外部状态**（真实指针是全局的，
+     不随 Electron 进程重启而复位）。
+     用视口 (2,2)（左上角，球带在底部，永远不会命中）。 */
+  await warpToViewport(2, 2);
+  await page.waitForTimeout(400);
   const idle = await probe();
   ok('静止态：穿透开启', idle.ignoring === true, idle);
   ok('静止态：lane = idle', idle.lane === 'idle', idle.lane);
@@ -248,6 +328,56 @@ const CFG = { dock: 'bottom', size: 30, gap: 8, sink: 0.32, offset: 0, showCard:
   ok('悬停：被悬停的球上探了',
      hotGeom.some((o) => o.hot && o.bottomOverflow < sinkPx - 5),
      hotGeom.filter((o) => o.hot).map((o) => o.bottomOverflow));
+
+  /* ── 7.5) 悬停稳定性：指针必须"待得住" ──
+     ⚠⚠ 这组断言是为了两层坑，两个都能让整个悬停体验彻底消失：
+
+     ① setShape 的 Rect 是**物理像素**，不是 DIP。
+        传 DIP 时 X 的 shape 会整体上移 155px，把球本身裁到外面；
+        指针一压到球上就落在"shape 之外"，X 把指针弹走（实测弹到 784,487），
+        下一帧轮询读到 idx=-1 → 卡片收回 → 球落回。
+        表现："悬停闪一下就没了"，而日志里 setShape 一切正常。
+
+     ② setPointerCapture 在 XWayland + 铺满工作区的 overlay 窗口上会引发
+        指针被"安置"到 fallback 位置（每次都一样，实测 680,425），
+        pointerup 的坐标全错 → 点击看着像点空了。
+
+     两者都只在"指针真的停在球上并持续一段时间"时才暴露。
+     所以这里不只看 warp 之后那一下，而是等 1.2s 再确认一遍，
+     并且核对球的几何相对指针没有漂移。 */
+  const hold1 = await probe();
+  await page.waitForTimeout(1200);
+  const hold2 = await probe();
+  ok('悬停：1.2s 后仍然保持 hot（指针没被 shape 弹走）',
+     hold2.hot >= 0 && hold2.lane === 'hot', { at700ms: hold1.hot, at1900ms: hold2.hot, lane: hold2.lane });
+  ok('悬停：1.2s 后卡片仍然亮着',
+     await page.$eval('#card', (e) => e.classList.contains('on')));
+
+  // 点一下球：走 Chromium 输入管线（等价真实鼠标），坐标必须准
+  await page.evaluate(() => {
+    window.__clickSeen = [];
+    window.addEventListener('click', (e) => { window.__clickSeen.push([Math.round(e.clientX), Math.round(e.clientY)]); }, true);
+  });
+  const hotOrbBox = await page.$$eval('.orb', (els) => {
+    const i = els.findIndex((e) => e.classList.contains('hot'));
+    if (i < 0) return null;
+    const r = els[i].getBoundingClientRect();
+    return { cx: Math.round(r.x + r.width / 2), cy: Math.round(r.y + r.height / 2) };
+  });
+  if (hotOrbBox) {
+    const mx = hotOrbBox.cx;
+    const my = hotOrbBox.cy;
+    await page.evaluate(({ x, y }) => {
+      const el = document.elementFromPoint(x, y);
+      el.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, clientX: x, clientY: y, button: 0, pointerId: 1 }));
+      el.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, clientX: x, clientY: y, button: 0, pointerId: 1 }));
+      el.dispatchEvent(new MouseEvent('click', { bubbles: true, clientX: x, clientY: y, button: 0 }));
+    }, { x: mx, y: my });
+  }
+  const clicked = await page.evaluate(() => (window.__clickSeen || []).slice(-1)[0] || null);
+  ok('点击：坐标落在球的中心（没有被 pointer capture 搬走）',
+     clicked && hotOrbBox && Math.abs(clicked[0] - hotOrbBox.cx) <= 2 && Math.abs(clicked[1] - hotOrbBox.cy) <= 2,
+     { sent: hotOrbBox, got: clicked });
 
   // ── 8) 移开回落（真实指针挪到屏幕角落）──
   await warpToViewport(2, 2);
