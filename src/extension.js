@@ -14,8 +14,13 @@ const { loadConfig, effectiveSide } = require('./config');
 const { Shell } = require('./shell');
 const { launchArgs, spawnEnv, findElectron } = require('./launcher');
 const gitModel = require('./git');
+const registry = require('./registry');
 
 const STATE_KEY = 'branchOrbs.shellUserData';
+/* 跨窗口注册表放在 globalStorage 的上一层，这样同一台机器上所有 VSCode 窗口
+   （哪怕用不同的 --user-data-dir 启动）都能读写同一个目录。
+   不能放 workspaceStorage —— 那是按工作区分的，窗口之间看不到彼此。 */
+const REGISTRY_DIR_NAME = 'branch-orbs-windows';
 
 /* ── git 可执行文件解析 ──
    ⚠ 踩过的坑：VSCode 的扩展宿主**不一定会继承你终端里的 PATH**（尤其是从
@@ -92,6 +97,34 @@ function activate(context) {
      ⚠ 落点必须是 **持久目录**，不能用 os.tmpdir() —— 那里会被系统清理，
        而且各次启动的 TMPDIR 可能不同，出问题回头根本找不到文件。 */
   const bootLogPath = path.join(context.globalStorageUri ? context.globalStorageUri.fsPath : os.homedir(), 'boot.log');
+
+  /* 跨窗口注册表目录：用一个**固定位置**，不能被 --user-data-dir 影响，
+     否则用不同 user-data 启动的窗口互相看不见。
+     优先 ~/.vscode-branch-orbs/windows（跨 user-data 共享），失败才退回 globalStorage。 */
+  const registryDir = (() => {
+    const shared = path.join(os.homedir(), '.vscode-branch-orbs', REGISTRY_DIR_NAME);
+    if (registry.ensureDir(shared)) return shared;
+    const local = path.join(context.globalStorageUri ? context.globalStorageUri.fsPath : os.tmpdir(), REGISTRY_DIR_NAME);
+    registry.ensureDir(local);
+    return local;
+  })();
+
+  /* 每个 VSCode 窗口一个稳定 id。存在 globalState 里，同一窗口重载后不变；
+     这样注册表文件不会被"每次激活换一个文件名"搞成一堆孤儿。 */
+  const windowId = (() => {
+    let id = null;
+    try {
+      id = context.globalState && context.globalState.get('branchOrbs.windowId');
+    } catch (_) {}
+    if (!id) {
+      id = 'w-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
+      try {
+        if (context.globalState) context.globalState.update('branchOrbs.windowId', id);
+      } catch (_) {}
+    }
+    return id;
+  })();
+
   function rawLog(line) {
     try {
       fs.mkdirSync(path.dirname(bootLogPath), { recursive: true });
@@ -161,7 +194,8 @@ function activate(context) {
         if (r.lastCommit) lines.push('最近：' + r.lastCommit.subject + '  (' + r.lastCommit.when + ')');
         if (repos.length > 1) {
           lines.push('');
-          lines.push('全部仓库：');
+          const wins = diagnostic.windows || [];
+          lines.push('全部仓库（' + repos.length + ' 个' + (wins.length > 1 ? '，来自 ' + wins.length + ' 个 VSCode 窗口' : '') + '）：');
           for (const x of repos) lines.push('  · ' + x.name + '  [' + x.branch + ']');
         }
         statusItem.tooltip = lines.join('\n');
@@ -459,10 +493,45 @@ function activate(context) {
           repos.push({ root: r, name: path.basename(r), branch: '?', error: e.message, changed: 0 });
         }
       }
-      diagnostic.repos = repos;
+
+      /* ── 跨窗口汇聚 ──
+         先把本窗口的仓库写进注册表，再读回所有窗口的。
+         这一步做完，用户开了三个 VSCode 窗口、每个开一个工程，
+         底部就会有三颗球，而不是只有当前窗口那一个。
+         注册表读写失败不能影响主流程（只读文件系统），所以整体 try 包住。 */
+      let merged = repos;
+      try {
+        registry.writeWindowRepos(registryDir, windowId, repos, {
+          workspace: (vscode.workspace.workspaceFolders || []).map((f) => f.uri.fsPath),
+        });
+        const all = registry.readAllRepos(registryDir);
+        if (all.repos.length > 0) {
+          // 本窗口的 isActive 优先（别的窗口也会上报 isActive，那是"它那边的活动文件"）
+          const mine = new Map(repos.map((r) => [r.root, r]));
+          merged = all.repos.map((r) => {
+            const local = mine.get(r.root);
+            if (local) return { ...r, isActive: local.isActive };
+            return r;
+          });
+          if (all.windows.length > 1) {
+            log('跨窗口汇聚：' + all.windows.length + ' 个窗口，共 ' + merged.length + ' 个仓库');
+          }
+        }
+      } catch (e) {
+        log('跨窗口注册表失败（忽略，仅影响多窗口）：' + e.message);
+      }
+
+      diagnostic.repos = merged;
+      diagnostic.windows = (() => {
+        try {
+          return registry.readAllRepos(registryDir).windows;
+        } catch (_) {
+          return [];
+        }
+      })();
 
       /* 主通道空手而归时走兜底 —— 否则用户只看到"没有球"，而内置 git 明明知道分支。 */
-      if (repos.length === 0) {
+      if (merged.length === 0) {
         const alt = await reposFromVscodeGit();
         if (alt && alt.length) {
           const activeRoot2 = aDir ? gitModel.findGitRoot(aDir) : null;
@@ -476,7 +545,7 @@ function activate(context) {
         }
       }
 
-      if (shell && shell.alive()) shell.send({ type: 'repos', repos: stripHeavy(repos) });
+      if (shell && shell.alive()) shell.send({ type: 'repos', repos: stripHeavy(merged) });
       firstRefreshDone = true;
       renderStatus();
 
@@ -641,6 +710,48 @@ function activate(context) {
     }
   }, 1500);
   context.subscriptions.push({ dispose: () => clearInterval(timer) });
+
+  /* ── 跨窗口心跳 ──
+     每 15s 重写一次本窗口的注册表文件（顺带刷新 git 数据），
+     别的窗口读到的 updatedAt 就不会过期。
+     同时读回全部窗口：如果"总仓库数"或"窗口数"和上次不同，
+     说明别的窗口开了/关了工程 —— 立刻把新列表推给壳，球会跟着增减。
+     这个定时器**不依赖 shell 是否存在**：没球时也要维持心跳，
+     否则别的窗口会以为我这个窗口已经关了。 */
+  let lastSeen = '';
+  function heartbeat(tick) {
+    let snapshot = null;
+    try {
+      registry.writeWindowRepos(registryDir, windowId, diagnostic.repos || [], {
+        workspace: (vscode.workspace.workspaceFolders || []).map((f) => f.uri.fsPath),
+      });
+      snapshot = registry.readAllRepos(registryDir);
+    } catch (_) {
+      return;
+    }
+    diagnostic.windows = snapshot.windows;
+    const sig = snapshot.repos.map((r) => r.root + '|' + r.branch).join(',') + '#' + snapshot.windows.length;
+    if (sig !== lastSeen) {
+      lastSeen = sig;
+      // 别的窗口有新东西：重新走一遍 refresh，让本窗口也把合并结果发给壳
+      refresh(true).catch(() => {});
+    } else if (tick % 4 === 0) {
+      // 纯心跳：顺带刷新本窗口 git 状态（可能会变，比如刚切了分支）
+      refresh(true).catch(() => {});
+    }
+  }
+  const hbTimer = setInterval(() => heartbeat(Math.floor(Date.now() / 15000)), 15000);
+  context.subscriptions.push({ dispose: () => clearInterval(hbTimer) });
+
+  /* 窗口关闭时把自己从注册表里摘掉 —— 否则别人的球里会残留一个死仓库
+     （虽然有 TTL 兜底，但主动清理能让反馈快 45 秒变成即时）。 */
+  context.subscriptions.push({
+    dispose: () => {
+      try {
+        registry.removeWindow(registryDir, windowId);
+      } catch (_) {}
+    },
+  });
 
   /* 先把状态栏豆子亮起来 —— 这一行一定成功（纯 VSCode API），
      即便后面壳进程起不来，用户也能在状态栏看到扩展在跑、能点开自检。 */
