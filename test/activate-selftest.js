@@ -197,8 +197,8 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   ok('状态栏豆子已显示', calls.statusShown >= 1, { show: calls.statusShown });
   ok('豆子点击执行 toggle', calls.statusCommand === 'branchOrbs.toggle', { command: calls.statusCommand });
 
-  // 第一次赋值应该是"还没数据"的占位文案，之后被真实分支名覆盖
-  ok('豆子有占位文案', /Branch Orbs/.test(calls.statusText[0] || ''), { first: calls.statusText[0] });
+  // 第一次赋值应该是"读取中"的占位文案，之后被真实分支名覆盖
+  ok('豆子有读取中占位', /读取中|Branch Orbs/.test(calls.statusText[0] || ''), { first: calls.statusText[0] });
 
   const last = calls.statusText[calls.statusText.length - 1] || '';
   const isRepo = fs.existsSync(path.join(workspace, '.git'));

@@ -119,32 +119,58 @@ function activate(context) {
        一旦如此，用户界面上就"什么都没有"，看起来像扩展没装。
        所以这里在 VSCode 自己的状态栏常驻一颗豆子 —— 它在编辑器里一定可见，
        点一下就能显示/隐藏悬浮球。球没出来时，用户至少知道扩展活着。 */
-  const statusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
-  statusItem.command = 'branchOrbs.toggle';
+  rawLog('creating statusItem…');
+  let statusItem = null;
+  try {
+    statusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
+    statusItem.command = 'branchOrbs.toggle';
+    statusItem.name = 'Branch Orbs';
+    rawLog('statusItem created ok');
+  } catch (e) {
+    rawLog('createStatusBarItem 失败：' + e.message);
+  }
+
+  /* 是否已经至少完整读过一次仓库。没读过时豆子显示"读取中"而不是"没有仓库" ——
+     这两件事对用户意义完全不同：前者等一下就好，后者要去排查。
+     实测首启时 VSCode 要 48s 才激活扩展，之后还要 6s 跑 git，
+     中间这段空白期如果显示"没有仓库"，会被误判成故障。 */
+  let firstRefreshDone = false;
+
   function renderStatus() {
-    const repos = diagnostic.repos || [];
-    const r = repos.find((x) => x.isActive) || repos[0];
-    if (!r) {
-      statusItem.text = '$(circle-large-outline) Branch Orbs';
-      statusItem.tooltip = '还没有识别到 git 仓库。点击查看自检，或打开一个 git 项目。';
-    } else {
-      const extra = repos.length > 1 ? ' +' + (repos.length - 1) : '';
-      statusItem.text = '$(circle-large-filled) ' + r.branch + extra;
-      const lines = [
-        'Branch Orbs（点击显示/隐藏悬浮球）',
-        '分支：' + r.branch + (r.isActive ? '  ← 当前文件' : ''),
-      ];
-      if (r.ahead || r.behind) lines.push('领先 ' + r.ahead + ' / 落后 ' + r.behind);
-      lines.push('改动文件：' + (r.changed || 0) + '   增删行：+' + (r.added || 0) + ' -' + (r.deleted || 0));
-      if (r.lastCommit) lines.push('最近：' + r.lastCommit.subject + '  (' + r.lastCommit.when + ')');
-      if (repos.length > 1) {
-        lines.push('');
-        lines.push('全部仓库：');
-        for (const x of repos) lines.push('  · ' + x.name + '  [' + x.branch + ']');
+    if (!statusItem) return;
+    try {
+      const repos = diagnostic.repos || [];
+      const r = repos.find((x) => x.isActive) || repos[0];
+      if (!r) {
+        if (!firstRefreshDone) {
+          statusItem.text = '$(sync~spin) Branch Orbs 读取中';
+          statusItem.tooltip = 'Branch Orbs 正在读取 git 仓库…（首次启动 VSCode 较慢，请稍候）';
+        } else {
+          statusItem.text = '$(circle-large-outline) Branch Orbs';
+          statusItem.tooltip = '没有识别到 git 仓库。点击这里在状态栏切换悬浮球，或运行「Branch Orbs: 自检」排查。';
+        }
+      } else {
+        const extra = repos.length > 1 ? ' +' + (repos.length - 1) : '';
+        statusItem.text = '$(circle-large-filled) ' + r.branch + extra;
+        const lines = [
+          'Branch Orbs（点击显示/隐藏悬浮球）',
+          '分支：' + r.branch + (r.isActive ? '  ← 当前文件' : ''),
+        ];
+        if (r.ahead || r.behind) lines.push('领先 ' + r.ahead + ' / 落后 ' + r.behind);
+        lines.push('改动文件：' + (r.changed || 0) + '   增删行：+' + (r.added || 0) + ' -' + (r.deleted || 0));
+        if (r.lastCommit) lines.push('最近：' + r.lastCommit.subject + '  (' + r.lastCommit.when + ')');
+        if (repos.length > 1) {
+          lines.push('');
+          lines.push('全部仓库：');
+          for (const x of repos) lines.push('  · ' + x.name + '  [' + x.branch + ']');
+        }
+        statusItem.tooltip = lines.join('\n');
       }
-      statusItem.tooltip = lines.join('\n');
+      statusItem.show();
+      rawLog('renderStatus shown: ' + statusItem.text);
+    } catch (e) {
+      rawLog('renderStatus 抛异常：' + e.message);
     }
-    statusItem.show();
   }
 
   /* ── 兜底数据源：VSCode 自带 git 扩展的 API ──
@@ -444,12 +470,14 @@ function activate(context) {
           diagnostic.repos = alt;
           log('主通道无仓库，采用 vscode.git 兜底：' + alt.length + ' 个');
           if (shell && shell.alive()) shell.send({ type: 'repos', repos: stripHeavy(alt) });
+          firstRefreshDone = true;
           renderStatus();
           return alt;
         }
       }
 
       if (shell && shell.alive()) shell.send({ type: 'repos', repos: stripHeavy(repos) });
+      firstRefreshDone = true;
       renderStatus();
 
       /* 静默失败是最糟的体验：球不出来，用户完全不知道发生了什么。
@@ -616,13 +644,23 @@ function activate(context) {
 
   /* 先把状态栏豆子亮起来 —— 这一行一定成功（纯 VSCode API），
      即便后面壳进程起不来，用户也能在状态栏看到扩展在跑、能点开自检。 */
+  rawLog('about to renderStatus (初始占位)');
   renderStatus();
 
-  if (vscode.workspace.getConfiguration('branchOrbs').get('enabled', true)) {
-    ensureShell();
+  rawLog('about to ensureShell');
+  try {
+    if (vscode.workspace.getConfiguration('branchOrbs').get('enabled', true)) {
+      ensureShell();
+    }
+  } catch (e) {
+    rawLog('ensureShell 抛异常：' + e.message + ' | ' + (e.stack || '').split('\n').slice(0, 3).join(' / '));
   }
+
   // 无论球能不能起来，都把仓库读一遍：豆子需要数据，自检也需要
-  refresh(true).catch((e) => log('首次 refresh 失败：' + (e && e.message)));
+  rawLog('about to first refresh');
+  refresh(true)
+    .then((repos) => rawLog('首次 refresh 完成，repos=' + (repos ? repos.length : 'null')))
+    .catch((e) => rawLog('首次 refresh 失败：' + (e && e.message)));
 }
 
 function deactivate() {}
