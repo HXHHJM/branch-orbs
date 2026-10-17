@@ -164,7 +164,24 @@ function devShmTooSmall() {
 }
 
 const BASE_FLAGS = {
-  linux: ['--ozone-platform=x11'],
+  /* ⚠⚠ --disable-features=CalculateNativeWinOcclusion 是"球过一会儿消失"的关键。
+
+     症状（用户实机，进程跑了一小时后）：窗口 mapped、位置正确、在最顶层，
+     但屏幕上看不到球；此时用 xlib GetImage 读窗口内容 = **全 0**。
+     而启动 2 秒时 probePixels（capturePage，读 Chromium 自己的帧缓冲）
+     明明有 849 个彩色像素 —— 页面一直在渲染，**是 Chromium → X 的提交链断了**。
+
+     机制：Chromium 的 occlusion tracker 在 XWayland 上会把"无焦点 +
+     铺满工作区的透明窗口"误判为被遮挡（壳是 showInactive 起的，
+     永远没有焦点，正好命中误判条件）→ 判定 occluded → 停止产帧。
+     启动头几秒 tracker 还没表态，帧照常提交（所以体检有像素）；
+     之后判定成 occluded，帧停了。XWayland 侧 buffer 被回收后
+     也没有人再补 —— 表现就是"球出现过一下，然后永久消失"。
+     backgroundThrottling:false 挡不住它（那是另一套节流）。
+
+     对策：命令行关掉 occlusion 计算。对这个壳来说没有任何代价 ——
+     它是个 overlay，"被遮挡时省电"本来就不是它要的优化。 */
+  linux: ['--ozone-platform=x11', '--disable-features=CalculateNativeWinOcclusion'],
   win32: [],
   darwin: [],
 };

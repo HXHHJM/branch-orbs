@@ -69,6 +69,16 @@ if (process.platform === 'linux' && WANT_OZONE === 'x11') {
      整个 renderer 崩溃 → 球永远画不出来，而日志干净得像没问题
      （preload 注入成功、did-finish-load 成功、就是 balls:0）。 */
 app.commandLine.appendSwitch('disable-dev-shm-usage');
+/* ⚠ 关闭 occlusion tracker：XWayland 上它会把"无焦点 + 铺满工作区的透明窗口"
+   误判为被遮挡 → Chromium 停止产帧 → 球"出现过一下然后永久消失"。
+   实测证据链：启动 2s 时 capturePage 有 849 个彩色像素（页面在画），
+   一小时后 xlib GetImage 读窗口内容全 0（帧没提交到 X）。
+   命令行（launcher.js BASE_FLAGS）是主通道；appendSwitch 是
+   re-exec/直接 node shell 路径的兜底。双保险无害。 */
+app.commandLine.appendSwitch(
+  'disable-features',
+  'CalculateNativeWinOcclusion'
+);
 if (process.platform === 'linux' && process.getuid && process.getuid() === 0) {
   // root 下 Chromium 拒绝启用沙箱，必须显式关闭，否则启动即 FATAL
   app.commandLine.appendSwitch('no-sandbox');
@@ -1289,6 +1299,124 @@ function probePixels() {
     .catch((e) => log('像素体检失败(可忽略): ' + e.message));
 }
 
+/* ── 内容自愈：X 侧持续盯梢 ─────────────────────────────
+
+   ⚠ 为什么 capturePage 不够：它读的是 Chromium **自己**的帧缓冲。
+      用户实机实测（进程跑一小时后）：
+        capturePage → 849 个彩色像素（页面一直在画，认为一切正常）
+        xlib GetImage 读 X 窗口 → 全 0（帧根本没提交到 X）
+      用户看不到球，而所有 Electron 侧证据都是绿的 —— 这就是
+      "球过一会儿消失"难以排查的原因：必须从 **X 侧**验尸。
+
+   机制（不依赖 occlusion 开关是否生效，作为最后兜底）：
+     每 30s 用 xlib 对窗口球带做一次 GetImage，数彩色像素；
+     连续 2 次全 0 且有仓库数据时，依次尝试三级自愈：
+       ① webContents.invalidate() —— 强制 Chromium 重绘一帧
+       ② 页面里触发强制重排 + 合成（对 compositor 施压）
+       ③ reload 页面（最重的一档，会闪一下，但球回来）
+     自愈成功后重置计数。 */
+
+let contentWatchTimer = null;
+let contentEmptyStreak = 0;
+let contentHealStage = 0;
+
+function bandColoredViaX() {
+  if (process.platform !== 'linux') return -1; // 非 linux 不监控
+  if (!state.win || state.win.isDestroyed()) return -1;
+  try {
+    const buf = state.win.getNativeWindowHandle();
+    const id = buf.readUInt32LE(0);
+    if (!id || id === 1) return -1; // ozone 选错，另一个问题，不在这里处理
+    const py = pythonCandidates()[0];
+    if (!py) return -1;
+    /* 球带（窗口内物理像素）：bottom 停靠 → 窗口底部 dockH+lift 那一条。
+       传给 xlib 时全部乘 scale（GetImage 用物理像素，见 syncShape 的教训）。 */
+    const sf = (() => {
+      try { return screen.getPrimaryDisplay().scaleFactor || 1; } catch (_) { return 1; }
+    })();
+    const met = anchors().metrics || {};
+    const bandH = Math.max(4, Math.round(((met.dockH || 38) + (met.lift || 19)) * sf));
+    const winPhysW = Math.round(state.win.getBounds().width * sf);
+    const out = require('child_process').execFileSync(py, ['-c', [
+      'import sys,json',
+      'from Xlib import display,X',
+      'd=display.Display(":0")',
+      'w=d.create_resource_object("window",int(sys.argv[1],0))',
+      'g=w.get_geometry()',
+      'bh,bw=int(sys.argv[2]),int(sys.argv[3])',
+      'img=w.get_image(0,max(0,g.height-bh),min(bw,g.width),min(bh,g.height),X.ZPixmap,0xffffffff)',
+      'dd=img.data; n=max(1,g.width)',
+      'c=0',
+      'for y in range(min(bh,g.height)):',
+      '    row=dd[y*n*4:(y+1)*n*4]',
+      '    for x in range(min(bw,g.width)):',
+      '        b,gr,r=row[x*4],row[x*4+1],row[x*4+2]',
+      '        if abs(r-gr)>18 or abs(gr-b)>18 or abs(r-b)>18: c+=1',
+      'print(c)',
+    ].join('\n'), '0x' + id.toString(16), String(bandH), String(winPhysW)], {
+      encoding: 'utf8', timeout: 5000, env: process.env,
+    });
+    return parseInt(out.trim(), 10) || 0;
+  } catch (_) {
+    return -1;
+  }
+}
+
+function healContent(stage) {
+  const wc = state.win && !state.win.isDestroyed() ? state.win.webContents : null;
+  if (stage <= 1) {
+    if (!wc) return;
+    log('自愈①: webContents.invalidate()');
+    try { wc.invalidate(); } catch (_) {}
+  } else if (stage === 2) {
+    if (!wc) return;
+    log('自愈②: 页面强制合成');
+    wc.executeJavaScript(
+      '(function(){var s=document.documentElement.style;' +
+      's.transform="translateZ(0)";void document.body.offsetWidth;' +
+      'requestAnimationFrame(function(){s.transform="";});})()'
+    ).catch(() => {});
+  } else if (stage === 3) {
+    /* ③ 重建为不透明窗口。
+       ⚠ 不要再用 reload —— 本机对照实验已证明 reload 无效：
+         页面一直在画（capturePage 有彩色像素），但 X 窗口内容全空，
+         问题不在页面，在"透明 overlay 的帧提交"这一层。
+         而同屏 VSCode（不透明 depth-24）窗口内容 100% 可读 —— 不透明窗口能呈现。
+         透明是构造期选项，只能销毁重建（rebuildOpaque 之前从未被调用过）。 */
+    log('自愈③: X 内容持续为空 → 降级重建不透明窗口');
+    rebuildOpaque();
+  } else {
+    log('自愈④: 建议切换 Electron 运行时（当前版本帧提交失效）');
+  }
+}
+
+function startContentWatch() {
+  if (contentWatchTimer || process.platform !== 'linux') return;
+  contentWatchTimer = setInterval(() => {
+    if (!state.win || state.win.isDestroyed() || !state.repos.length) return;
+    const n = bandColoredViaX();
+    if (n < 0) return; // 读不到（非 X 环境/handle 无效）就不下结论
+    if (n > 0) {
+      if (contentEmptyStreak > 0) log('X 内容自检恢复: 彩色像素 ' + n);
+      contentEmptyStreak = 0;
+      contentHealStage = 0;
+      return;
+    }
+    contentEmptyStreak++;
+    log('⚠ X 侧内容自检: 球带全空 (' + contentEmptyStreak + '/2)');
+    if (contentEmptyStreak >= 2) {
+      contentHealStage++;
+      healContent(contentHealStage);
+      contentEmptyStreak = 0;
+      /* stage 3 已改为"重建不透明窗口"（reload 对帧提交失效无济于事）。
+         若重建后仍然空（stage 4+），说明连不透明都呈现不了，
+         重置 stage 只会原地循环 → 改为永久停在 4，只留日志不再折腾。 */
+      if (contentHealStage > 4) contentHealStage = 4;
+    }
+  }, 5000);
+  log('X 内容自检已启动（每 5s 盯一次球带）');
+}
+
 /* ───────────────────────── 窗口 ───────────────────────── */
 
 function createWindow() {
@@ -1360,6 +1488,7 @@ function createWindow() {
   state.lane = LANE_IDLE;
   state.ignoring = true;
   startPoll();
+  startContentWatch();
 
   // 自测驱动口：只在 BRANCH_ORBS_TEST=1 时挂上。
   // 外部（Playwright）没法往 stdin 里写字，所以留一个等价的注入点 ——
