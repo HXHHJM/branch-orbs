@@ -665,7 +665,7 @@ function activate(context) {
         break;
       case 'click': {
         const repo = m.repo || diagnostic.repos[m.index];
-        if (repo) openRepo(repo);
+        if (repo) toggleWindow(repo);
         break;
       }      case 'menu': {
         const repo = diagnostic.repos[m.index];
@@ -881,6 +881,71 @@ function activate(context) {
       return;
     }
     vscode.commands.executeCommand('vscode.openFolder', vscode.Uri.file(repo.root), { forceNewWindow: false });
+  }
+
+  /* ── 点击悬浮球 = 展开 / 收起对应的 VSCode 窗口 ──
+     实现走 X11 EWMH 客户端消息（src/xwin.py）：
+       窗口被最小化(_NET_WM_STATE_HIDDEN) → 发 _NET_ACTIVE_WINDOW 恢复置前
+       窗口可见 → 发 WM_CHANGE_STATE(IconicState) 最小化
+     为什么不用 VSCode 命令：只有 workbench.action.minimizeWindow（收起），
+     **没有取消最小化的命令** —— 收起后就回不来了，必须走 X11。
+     为什么按标题匹配：VSCode 窗口标题默认是 "<文件夹名> - Visual Studio Code"，
+     传 repo.name 即可命中；同一个仓库跨窗口共享一颗球，多窗口会一起动。
+
+     降级链：python-xlib 不可用 / 非 X11 / 找不到窗口 → 退回旧的"跳转仓库"。
+     缓存解析结果，避免每次点击都探测一遍 python。 */
+  let xwinPython = null;
+  function resolveXwinPython() {
+    if (xwinPython !== null) return xwinPython;
+    const candidates = [
+      process.env.BRANCH_ORBS_PYTHON,
+      '/home/hy/.workbuddy/binaries/python/envs/default/bin/python',
+      path.join(os.homedir(), '.workbuddy/binaries/python/envs/default/bin/python'),
+      '/usr/bin/python3',
+    ].filter(Boolean);
+    xwinPython = false; // 先置 false：全都不行就不再重试
+    for (const py of candidates) {
+      try {
+        cp.execFileSync(py, ['-c', 'import Xlib'], { timeout: 5000 });
+        xwinPython = py;
+        break;
+      } catch (_) {}
+    }
+    return xwinPython;
+  }
+
+  function toggleWindow(repo) {
+    const py = resolveXwinPython();
+    if (!py) {
+      openRepo(repo); // 没有 X11 控制能力：退回旧行为
+      return;
+    }
+    const script = path.join(context.extensionPath, 'src', 'xwin.py');
+    cp.execFile(
+      py,
+      [script, 'toggle', repo.name],
+      { timeout: 4000 },
+      (err, stdout) => {
+        let out = null;
+        try {
+          out = JSON.parse(String(stdout));
+        } catch (_) {}
+        /* 命中不到窗口 = 正常情况（工程还没加载完、标题不带文件夹名），
+           脚本会返回 {ok:false, error:'no-matching-window'} 而不是非零退出码。
+           这种情况退回旧行为"跳转仓库"，不报错。 */
+        if (err && !out) {
+          log('toggleWindow 失败：' + String(err.message).slice(0, 200));
+          openRepo(repo);
+          return;
+        }
+        if (!out || !out.ok || !out.changed) {
+          log('toggleWindow 未命中窗口：' + repo.name + '（退回跳转仓库）');
+          openRepo(repo);
+          return;
+        }
+        log('toggleWindow: ' + repo.name + ' → 已切换 ' + out.changed + ' 个窗口');
+      }
+    );
   }
 
   /* ── 显示 / 隐藏 ── */
