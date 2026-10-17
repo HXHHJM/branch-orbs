@@ -183,6 +183,12 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const uninstall = installFakeVscode(vscode);
 
   const storage = fs.mkdtempSync(path.join(os.tmpdir(), 'branch-orbs-act-'));
+
+  /* 隔离跨窗口注册表：否则会读到机器上真实的多窗口数据（或上一个测试遗留的条目），
+     "存活豆子数 == 仓库数"这类断言就会随机失败。 */
+  const regDir = fs.mkdtempSync(path.join(os.tmpdir(), 'branch-orbs-reg-'));
+  process.env.BRANCH_ORBS_REGISTRY_DIR = regDir;
+
   const ctx = {
     extensionPath: ROOT,
     globalStorageUri: { fsPath: storage },
@@ -202,6 +208,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     console.log('\n' + activateError.stack);
     uninstall();
     fs.rmSync(storage, { recursive: true, force: true });
+  fs.rmSync(regDir, { recursive: true, force: true });
     console.error(`\n${results.filter((r) => r.pass).length}/${results.length} passed`);
     process.exit(1);
   }
@@ -325,6 +332,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   uninstall();
   fs.rmSync(storage, { recursive: true, force: true });
+  fs.rmSync(regDir, { recursive: true, force: true });
 
   const passed = results.filter((r) => r.pass).length;
   console.log(`\n${passed}/${results.length} passed`);

@@ -27,7 +27,110 @@ const REGISTRY_DIR_NAME = 'branch-orbs-windows';
      桌面图标/启动器拉起时，PATH 常常只有 /usr/local/bin:/usr/bin:/bin）。
      此时 execFile('git') 抛 ENOENT，discoverRepos 拿到空数组，
      → 球一个都不出现，而且**界面上没有任何错误提示**。
-     所以这里做三级兜底：PATH → 常见安装位置 → VSCode 自带 git 设置。 */
+     所以这里做分级兜底：显式设置 → PATH → 常见安装位置 → 包管理器/工具链目录 → 全盘轻扫。 */
+
+/* 已知的"git 可能藏在哪"目录模板。
+   为什么需要这些：本机（以及很多精简容器/WSL）**系统级根本没装 git**，
+   只有某个工具链自带一份（例如 WorkBuddy 的 ~/.workbuddy/binaries/tools/bin/git）。
+   这类路径既不在 PATH 里，也不是发行版标准位置，不列出来就永远找不到。 */
+function gitCandidateDirs() {
+  const home = os.homedir();
+  const dirs = [];
+  const add = (p) => {
+    if (p && !dirs.includes(p)) dirs.push(p);
+  };
+
+  if (process.platform === 'win32') {
+    for (const base of [process.env.ProgramFiles, process.env['ProgramFiles(x86)'], process.env.LOCALAPPDATA]) {
+      if (!base) continue;
+      add(path.join(base, 'Git', 'cmd'));
+      add(path.join(base, 'Git', 'bin'));
+      add(path.join(base, 'Programs', 'Git', 'cmd'));
+    }
+    add('C:\\Program Files\\Git\\cmd');
+    add('C:\\Program Files\\Git\\bin');
+    add(path.join(home, 'scoop', 'shims'));
+    add(path.join(process.env.USERPROFILE || home, 'scoop', 'shims'));
+    // Git for Windows 便携版
+    add(path.join(home, 'PortableGit', 'cmd'));
+    return dirs;
+  }
+
+  // 发行版标准位置
+  for (const p of ['/usr/bin', '/usr/local/bin', '/bin', '/opt/homebrew/bin', '/usr/local/git/bin', '/snap/bin', '/opt/local/bin']) {
+    add(p);
+  }
+  // Nix / Guix
+  add('/run/current-system/sw/bin');
+  add(path.join(home, '.nix-profile', 'bin'));
+
+  /* 工具链/包管理器自带的 git —— 这是本机唯一可用的来源。
+     不要硬编码某台机器的绝对路径，按"目录形状"猜：<某工具链根>/bin/git。 */
+  const toolchainRoots = [
+    path.join(home, '.workbuddy', 'binaries', 'tools'),   // WorkBuddy 托管工具
+    path.join(home, '.local'),
+    path.join(home, '.linuxbrew'),
+    path.join(home, 'homebrew'),
+    path.join(home, 'miniconda3'),
+    path.join(home, 'anaconda3'),
+    path.join(home, '.conda'),
+    '/opt/homebrew',
+    '/opt/conda',
+    '/home/linuxbrew/.linuxbrew',
+  ];
+  for (const root of toolchainRoots) add(path.join(root, 'bin'));
+
+  // PATH 里已有的目录（含兄弟目录）
+  for (const p of (process.env.PATH || '').split(path.delimiter)) {
+    if (p) add(p);
+  }
+
+  // 当前 node 可执行文件所在目录的兄弟（有些环境把 git 和 node 放一起）
+  try {
+    add(path.dirname(process.execPath));
+  } catch (_) {}
+
+  return dirs;
+}
+
+/* 全盘轻扫兜底：只在上面全部失败时才跑，且**限制深度**。
+   扫 ~ 下的 3 层足够覆盖 ~/.xxx/bin/git 这类；不扫 / 以免卡死。 */
+function shallowFindGit() {
+  if (process.platform === 'win32') return [];
+  const home = os.homedir();
+  const roots = [home, '/opt', '/usr/local'];
+  const names = new Set(['git']);
+  const found = [];
+  const MAX_DEPTH = 3;
+
+  const walk = (dir, depth) => {
+    if (depth > MAX_DEPTH || found.length >= 8) return;
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch (_) {
+      return;
+    }
+    for (const e of entries) {
+      if (found.length >= 8) return;
+      // 跳过明显无关/巨大的目录
+      if (e.isDirectory()) {
+        if (['node_modules', '.git', 'proc', 'sys', 'dev', 'snap', 'lib', 'share', 'include', 'man'].includes(e.name)) continue;
+        walk(path.join(dir, e.name), depth + 1);
+      } else if (names.has(e.name)) {
+        const full = path.join(dir, e.name);
+        try {
+          const st = fs.statSync(full);
+          if (st.isFile() && (st.mode & 0o111) !== 0) found.push(full);
+        } catch (_) {}
+      }
+    }
+  };
+
+  for (const r of roots) walk(r, 0);
+  return found;
+}
+
 let gitPathCache = null;
 function resolveGit() {
   if (gitPathCache !== null) return gitPathCache;
@@ -50,24 +153,8 @@ function resolveGit() {
     if (first) cands.push(first);
   } catch (_) {}
 
-  // ③ 常见安装位置
-  if (process.platform === 'win32') {
-    for (const base of [process.env.ProgramFiles, process.env['ProgramFiles(x86)'], process.env.LOCALAPPDATA]) {
-      if (base) cands.push(path.join(base, 'Git', 'cmd', exe), path.join(base, 'Programs', 'Git', 'cmd', exe));
-    }
-    // 便携版常见位置
-    cands.push('C:\\Program Files\\Git\\bin\\git.exe', 'C:\\Program Files\\Git\\cmd\\git.exe');
-  } else {
-    cands.push(
-      '/usr/bin/git', '/usr/local/bin/git', '/bin/git',
-      '/opt/homebrew/bin/git', '/usr/local/git/bin/git',
-      '/snap/bin/git', '/opt/local/bin/git'
-    );
-    // 便携/自建工具链：按 PATH 里已有的目录猜兄弟目录，别硬编码某台机器
-    for (const p of (process.env.PATH || '').split(path.delimiter)) {
-      if (p) cands.push(path.join(p, 'git'));
-    }
-  }
+  // ③ 已知目录模板（含工具链自带 git）
+  for (const d of gitCandidateDirs()) cands.push(path.join(d, exe));
 
   // ④ VSCode 自带的 git（有些发行版把 git 塞进 resources/app）
   if (process.platform !== 'win32') {
@@ -77,14 +164,31 @@ function resolveGit() {
   // ⑤ 兜底：直接试 'git'（PATH 里有但 which 不可用时仍能跑）
   cands.push('git');
 
-  for (const c of cands) {
+  const tryRun = (c) => {
     try {
-      if (c !== 'git' && !fs.existsSync(c)) continue;
+      if (c !== 'git' && !fs.existsSync(c)) return false;
       cp.execFileSync(c, ['--version'], { timeout: 3000, stdio: 'ignore' });
+      return true;
+    } catch (_) {
+      return false;
+    }
+  };
+
+  for (const c of cands) {
+    if (tryRun(c)) {
       gitPathCache = c;
       return c;
-    } catch (_) {}
+    }
   }
+
+  // ⑥ 最后手段：全盘轻扫（只在前面全失败时才跑，最多 8 个结果、深度 3）
+  for (const c of shallowFindGit()) {
+    if (tryRun(c)) {
+      gitPathCache = c;
+      return c;
+    }
+  }
+
   gitPathCache = null;
   return null;
 }
@@ -100,8 +204,17 @@ function activate(context) {
 
   /* 跨窗口注册表目录：用一个**固定位置**，不能被 --user-data-dir 影响，
      否则用不同 user-data 启动的窗口互相看不见。
-     优先 ~/.vscode-branch-orbs/windows（跨 user-data 共享），失败才退回 globalStorage。 */
+     优先 ~/.vscode-branch-orbs/windows（跨 user-data 共享），失败才退回 globalStorage。
+
+     BRANCH_ORBS_REGISTRY_DIR 是给自测用的逃生门：不设它就是真实的共享目录，
+     设了就用指定目录 —— 这样单元测试不会读到/污染你机器上真实的多窗口数据
+     （之前 activate-selftest 就因此偶发失败：读到上一个测试遗留的窗口条目）。 */
   const registryDir = (() => {
+    const override = process.env.BRANCH_ORBS_REGISTRY_DIR;
+    if (override) {
+      registry.ensureDir(override);
+      return override;
+    }
     const shared = path.join(os.homedir(), '.vscode-branch-orbs', REGISTRY_DIR_NAME);
     if (registry.ensureDir(shared)) return shared;
     const local = path.join(context.globalStorageUri ? context.globalStorageUri.fsPath : os.tmpdir(), REGISTRY_DIR_NAME);
