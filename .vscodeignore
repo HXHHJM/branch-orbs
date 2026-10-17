@@ -1,0 +1,5 @@
+test
+.workbuddy
+*.vsix
+node_modules
+.gitignore

@@ -1,0 +1,400 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:;">
+<title>Branch Orbs</title>
+<style>
+  /* ══ 布局契约（跟 main.js 的 anchors() 严格对齐，改一边必须改另一边）══
+
+     窗口 = 从下往上四段：球位(dockH = 球高) + 上探区(lift) + 卡片(cardH) + 余量
+        · 球贴窗口**底边**，底边再被 --sink 往下推 → 视觉上"沉"下去一角
+        · 悬停时球 -lift 上探，探进 lift 区，不会被裁
+        · 卡片贴在 lift 区上方，从下往上长
+
+     关键不变式：#dock 的高度**等于球高**（不含任何底部留白）。
+     多一个 padding 就会让 bottom:-sink 不再是"球越界的精确像素数"，
+     实测就差了 3px（报 5px、实际只有 2.35px 露在窗口外）。 */
+  :root {
+    --size: 30px;
+    --gap: 8px;
+    --lift: 18px;
+    --sink: 0px;
+    --dock-h: var(--size);
+    --fg: rgba(255,255,255,.94);
+    --muted: rgba(255,255,255,.60);
+  }
+  html, body {
+    margin: 0; padding: 0; background: transparent; overflow: hidden;
+    font: 12px/1.35 "Segoe UI", "PingFang SC", "Noto Sans CJK SC", "Microsoft YaHei", system-ui, sans-serif;
+    color: var(--fg);
+    -webkit-user-select: none; user-select: none;
+    cursor: default;
+  }
+
+  /* dock 居中，宽度由内容决定且**不参与**尺寸决策（尺寸由 dockSize() 直接算） */
+  #dock {
+    position: absolute; left: 50%; bottom: 0;
+    transform: translateX(-50%);
+    height: var(--size);
+    display: flex; align-items: flex-start; gap: var(--gap);
+    width: max-content;
+  }
+  /* ⚠ 下沉（sink）由页面完成，不是把窗口挪到屏幕外：
+     X11/mutter 会把窗口钳制在工作区内，挪出去会被拉回来（sink 恒为 0）。
+     这里把 dock 整体往下推 --sink，球超出窗口底边的那一段被 overflow 裁掉 ——
+     视觉上就是"球沉下去一角"，而且完全不受 WM 影响。
+     dock 高度 = 球高，不含任何底部留白，所以 bottom:-sink 精确等于球的越界量。 */
+  body.sink #dock { bottom: calc(-1 * var(--sink)); }
+  /* top 停靠：整条镜像到窗口顶边 */
+  body.top #dock {
+    bottom: auto; top: 0;
+    align-items: flex-end;
+  }
+  body.top.sink #dock { top: calc(-1 * var(--sink)); }
+
+  .orb {
+    width: var(--size); height: var(--size); border-radius: 50%;
+    position: relative; flex: 0 0 auto;
+    transform: translateY(0) scale(1);
+    transition: transform .24s cubic-bezier(.2,.9,.25,1.2), box-shadow .18s ease, filter .18s;
+    background:
+      radial-gradient(circle at 34% 26%, rgba(255,255,255,.62) 0%, rgba(255,255,255,.12) 30%, transparent 56%),
+      radial-gradient(circle at 50% 118%, rgba(0,0,0,.48) 0%, transparent 60%),
+      var(--c, #6b7280);
+    box-shadow:
+      inset 0 0 0 1px rgba(255,255,255,.18),
+      0 5px 12px -5px rgba(0,0,0,.9);
+  }
+  .orb::after {
+    content: ""; position: absolute; inset: 0; border-radius: 50%;
+    box-shadow: inset 0 -5px 9px -5px rgba(0,0,0,.72);
+    pointer-events: none;
+  }
+  /* 悬停：上探 + 放大 + 一圈光 */
+  .orb.hot {
+    transform: translateY(calc(-1 * var(--lift))) scale(1.18);
+    box-shadow:
+      inset 0 0 0 1px rgba(255,255,255,.46),
+      0 9px 18px -7px rgba(0,0,0,.95),
+      0 0 0 5px rgba(255,255,255,.075);
+    z-index: 3;
+  }
+  body.top .orb.hot { transform: translateY(var(--lift)) scale(1.18); }
+  body.top .orb::after { box-shadow: inset 0 5px 9px -5px rgba(0,0,0,.72); }
+
+  /* 有未提交改动 */
+  .orb .dot {
+    position: absolute; right: -1px; top: -1px; width: 7px; height: 7px; border-radius: 50%;
+    background: #f5a524; box-shadow: 0 0 0 1.5px rgba(22,22,26,.92);
+    display: none;
+  }
+  .orb.dirty .dot { display: block; }
+  /* 当前活动仓库 */
+  .orb.active { box-shadow: inset 0 0 0 1.5px rgba(255,255,255,.72), 0 5px 12px -5px rgba(0,0,0,.9); }
+  .orb.error { filter: grayscale(1) brightness(.7); }
+
+  /* ── 信息卡：贴 LIFT 区上方，从窗口底边往上量 ───────────────── */
+  #card {
+    position: absolute;
+    left: 50%;
+    bottom: calc(var(--dock-h) + var(--lift) + 8px);
+    --dx: 0px;
+    transform: translateX(calc(-50% + var(--dx))) translateY(6px);
+    width: max-content; max-width: 320px;
+    padding: 9px 11px 9px;
+    box-sizing: border-box;
+    border-radius: 10px;
+    background: rgba(30,31,36,.965);
+    box-shadow: 0 14px 30px -12px rgba(0,0,0,.95), inset 0 0 0 1px rgba(255,255,255,.10);
+    opacity: 0;
+    transition: opacity .13s ease, transform .17s cubic-bezier(.2,.9,.3,1.08);
+    pointer-events: none; visibility: hidden;
+    white-space: nowrap;
+  }
+  #card.on { opacity: 1; transform: translateX(calc(-50% + var(--dx))) translateY(0); visibility: visible; }
+  body.top #card {
+    bottom: auto; top: calc(var(--dock-h) + var(--lift) + 8px);
+    transform: translateX(calc(-50% + var(--dx))) translateY(-6px);
+  }
+  body.top #card.on { transform: translateX(calc(-50% + var(--dx))) translateY(0); }
+
+  .row1 { display: flex; align-items: center; gap: 7px; }
+  .sw { width: 9px; height: 9px; border-radius: 50%; flex: 0 0 auto; background: var(--c); }
+  #branch { font-weight: 600; font-size: 12.5px; letter-spacing: .1px; }
+  #repo { color: var(--muted); font-size: 11px; margin-top: 4px; }
+  #meta { display: flex; gap: 9px; margin-top: 6px; font-size: 11px; color: var(--muted); }
+  #meta .up { color: #5ed47a; }
+  #meta .dn { color: #ff6b64; }
+  #meta .warn { color: #e6b450; }
+  #last {
+    margin-top: 7px; padding-top: 6px; border-top: 1px solid rgba(255,255,255,.09);
+    font-size: 11px; color: var(--muted);
+  }
+  #last .subj { color: rgba(255,255,255,.80); }
+  #hint { margin-top: 5px; font-size: 10.5px; color: rgba(255,255,255,.34); }
+</style>
+</head>
+<body>
+  <div id="dock"></div>
+  <div id="card">
+    <div class="row1"><span class="sw" id="sw"></span><span id="branch"></span></div>
+    <div id="repo"></div>
+    <div id="meta"></div>
+    <div id="last"></div>
+    <div id="hint"></div>
+  </div>
+<script>
+(function () {
+  var api = window.orbs;
+  var cfg = { size: 30, gap: 8, sink: 0.32, showCard: true, dock: 'bottom' };
+  var repos = [];
+  var hot = -1;
+  var dock = document.getElementById('dock');
+  var card = document.getElementById('card');
+
+  function post(t, p) { api.send(t, p || {}); }
+
+  /* FNV-1a → HSL。同一分支名永远同一个色，不需要维护调色板 */
+  function colorFor(s) {
+    var h = 0x811c9dc5;
+    for (var i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
+    return 'hsl(' + (h % 360) + ' ' + (46 + ((h >>> 9) % 26)) + '% ' + (39 + ((h >>> 17) % 14)) + '%)';
+  }
+
+  function render() {
+    var root = document.documentElement.style;
+    var sinkPx = Math.round((cfg.size / 2) * (cfg.sink == null ? 0.32 : cfg.sink));
+    root.setProperty('--size', cfg.size + 'px');
+    root.setProperty('--gap', cfg.gap + 'px');
+    root.setProperty('--lift', Math.round(cfg.size * 0.6) + 'px');
+    root.setProperty('--sink', sinkPx + 'px');
+    document.body.classList.toggle('top', cfg.dock === 'top');
+    document.body.classList.toggle('sink', sinkPx > 0);
+
+    dock.textContent = '';
+    repos.forEach(function (r, i) {
+      var b = document.createElement('div');
+      b.className = 'orb' + (r.changed > 0 ? ' dirty' : '') + (r.error ? ' error' : '') + (r.isActive ? ' active' : '');
+      b.style.setProperty('--c', colorFor(r.branch || r.name));
+      b.dataset.i = String(i);
+      b.title = (r.name || '') + '  ·  ' + (r.branch || '');
+      var dot = document.createElement('i'); dot.className = 'dot';
+      b.appendChild(dot);
+      dock.appendChild(b);
+    });
+    if (hot >= repos.length) hot = -1;
+    paintHot();
+    repositionCard();
+    measure();
+  }
+
+  function paintHot() {
+    for (var i = 0; i < dock.children.length; i++) {
+      dock.children[i].classList.toggle('hot', i === hot);
+    }
+    if (hot >= 0) { fillCard(repos[hot]); card.classList.add('on'); }
+    else card.classList.remove('on');
+    measure(true);
+  }
+
+  function fillCard(r) {
+    document.getElementById('sw').style.setProperty('--c', colorFor(r.branch || r.name));
+    document.getElementById('branch').textContent = r.branch || '(unknown)';
+    document.getElementById('repo').textContent = r.name;
+    document.getElementById('hint').textContent = r.error ? 'git 读取失败' : '单击：切到该仓库 · 右键：更多';
+
+    var meta = document.getElementById('meta');
+    meta.textContent = '';
+    if (r.changed > 0) {
+      add(meta, '', r.changed + ' 个改动');
+      if (r.added || r.deleted) { add(meta, 'up', '+' + r.added); add(meta, 'dn', '−' + r.deleted); }
+    } else add(meta, '', '工作区干净');
+    if (r.ahead) add(meta, 'up', '↑' + r.ahead);
+    if (r.behind) add(meta, 'dn', '↓' + r.behind);
+    if (r.detached) add(meta, 'warn', 'detached');
+
+    var last = document.getElementById('last');
+    last.textContent = '';
+    if (r.lastCommit && r.lastCommit.subject) {
+      var s = document.createElement('span'); s.className = 'subj'; s.textContent = r.lastCommit.subject;
+      last.appendChild(s);
+      last.appendChild(document.createTextNode('  ·  ' + (r.lastCommit.when || '')));
+    } else last.textContent = r.error ? '—' : '暂无提交';
+  }
+
+  /* 卡片水平跟随目标球。卡片本来用 left:50% + translateX(-50%) 居中，
+     这里把 --dx 叠加上去，落在"目标球中心"，再夹到窗口内。 */
+  function repositionCard() {
+    var orb = hot >= 0 ? dock.children[hot] : null;
+    if (!orb) { card.style.setProperty('--dx', '0px'); return; }
+    var dx = (orb.offsetLeft + orb.offsetWidth / 2) - dock.offsetWidth / 2;
+    var winW = window.innerWidth || 1;
+    var cardW = card.offsetWidth || 0;
+    if (cardW > 0) {
+      var half = cardW / 2 + 6;
+      var cx = winW / 2 + dx;                        // 球中心在窗口内的 x
+      if (winW < half * 2) cx = winW / 2;            // 窗口比卡片还窄：只能居中
+      else cx = Math.max(half, Math.min(winW - half, cx));
+      dx = cx - winW / 2;
+    }
+    card.style.setProperty('--dx', Math.round(dx) + 'px');
+  }
+
+  function add(parent, cls, text) {
+    var e = document.createElement('span'); if (cls) e.className = cls; e.textContent = text; parent.appendChild(e);
+  }
+
+  /* ══ 尺寸上报 ══════════════════════════════════════════════════════
+     ⚠⚠ 整个扩展里最大的一个坑，值一整段注释。
+
+     最初写法：量 #dock 的 offsetWidth 报给主进程 setBounds。结果窗口一路缩到 5×4，
+     球彻底消失。链条是这样的：
+
+       窗口变窄 → html overflow:hidden 把绝对定位的 dock 夹到窗口宽
+                 (窗口窄到 0 时 flex 容器的 min-content 也是 0)
+                 → 量出来的 dockW ≈ 0 → 主进程按 0 设窗口 → 更窄 → ...
+       这是正反馈，任何"量被夹住的元素"的写法都逃不掉。
+
+     正确做法：**测量与渲染解耦**。
+       1. 窗口需要多大，由"球的数量 × 配置"直接算，不读 DOM；
+       2. 卡片的自然尺寸用一份 visibility:hidden 的克隆，挂在 fixed 定位的
+          离屏容器里量 —— 它不受窗口宽度约束（宽度由内容决定）。 */
+
+  var PAD_X = 12;        // 两侧各留 6，给悬停放大的球一点余量
+
+  function dockSize() {
+    var n = dock.children.length;
+    if (!n) return { w: PAD_X + 4, h: cfg.size };
+    return { w: PAD_X + n * cfg.size + (n - 1) * cfg.gap, h: cfg.size };
+  }
+
+  /* 离屏测量容器：fixed 定位、在视口外，宽度由内容决定 */
+  var stage = null;
+  function measureCard() {
+    if (!stage) {
+      stage = document.createElement('div');
+      stage.style.cssText = 'position:fixed;left:-5000px;top:0;width:2000px;height:600px;' +
+                            'pointer-events:none;visibility:hidden;overflow:visible;';
+      document.documentElement.appendChild(stage);
+    }
+    var clone = card.cloneNode(true);
+    clone.classList.add('on');
+    clone.style.cssText = 'position:absolute;left:0;top:0;opacity:1;transform:none;visibility:visible;' +
+                          'width:max-content;max-width:320px;height:auto;bottom:auto;';
+    stage.appendChild(clone);
+    var r = clone.getBoundingClientRect();
+    stage.removeChild(clone);
+    // 卡片离球顶还有 8px 间隙，再加 2px 余量防止亚像素裁切
+    return { w: Math.ceil(r.width) + 6, h: Math.ceil(r.height) + 14 };
+  }
+
+  var lastPosted = '';
+  function measure(force) {
+    var cardOn = card.classList.contains('on');
+    var d = dockSize();
+    var cs = cardOn ? measureCard() : { w: 0, h: 0 };
+    var m = { dockW: d.w, dockH: d.h, cardW: cs.w, cardH: cs.h };
+    window.__lastMeasure = m;
+    var key = JSON.stringify(m);
+    // 去重是必须的（measure 会被 resize/字体/悬停多处触发），
+    // 但"卡片开合"这种状态变化必须强制发一次 —— 否则主进程收不到
+    // "卡片没了、尺寸该缩回去"这条消息，窗口会一直停在悬停时的大尺寸。
+    if (!force && key === lastPosted) return;
+    lastPosted = key;
+    post('measure', m);
+  }
+
+  /* ── 指针：悬停判定完全在页面里做 ── */
+  function orbAt(node) {
+    while (node && node !== dock) {
+      if (node.classList && node.classList.contains('orb')) return node;
+      node = node.parentNode;
+    }
+    return null;
+  }
+
+  dock.addEventListener('pointerover', function (e) {
+    var t = orbAt(e.target);
+    if (!t) return;
+    var i = +t.dataset.i;
+    if (i === hot) return;
+    hot = i;
+    paintHot();
+    repositionCard();
+    post('hover', { index: i });
+  });
+  document.addEventListener('pointerleave', function () {
+    if (hot < 0) return;
+    hot = -1; paintHot(); post('hover', { index: -1 });
+  });
+  document.addEventListener('pointermove', function (e) {
+    /* 球的间隙、卡片区域都不算"在球上" */
+    if (hot < 0) return;
+    if (down) return; /* 拖动中不移除 hot，否则上探会自己收回去 */
+    var t = orbAt(e.target);
+    if (!t) { hot = -1; paintHot(); post('hover', { index: -1 }); }
+  });
+
+  /* ── 点击 / 拖动 / 右键 ── */
+  var down = null;
+  dock.addEventListener('pointerdown', function (e) {
+    var t = orbAt(e.target);
+    if (!t) return;
+    down = { i: +t.dataset.i, sx: e.screenX, sy: e.screenY, moved: false, button: e.button, id: e.pointerId };
+    if (e.button === 0) { try { dock.setPointerCapture(e.pointerId); } catch (_) {} }
+    e.preventDefault();
+  });
+  window.addEventListener('pointermove', function (e) {
+    if (!down) return;
+    if (!down.moved && Math.hypot(e.screenX - down.sx, e.screenY - down.sy) > 5) {
+      down.moved = true;
+      post('dragstart', {});
+    }
+    if (down.moved) post('dragmove', { screenX: e.screenX, screenY: e.screenY });
+  });
+  window.addEventListener('pointerup', function (e) {
+    if (!down) return;
+    var d = down; down = null;
+    try { dock.releasePointerCapture(e.pointerId); } catch (_) {}
+    if (d.moved) { post('dragend', {}); return; }
+    if (d.button === 0) post('click', { index: d.i });
+    else if (d.button === 2) post('context', { index: d.i, x: e.clientX, y: e.clientY });
+  });
+  window.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+
+  /* ── 来自主进程的状态 ── */
+  api.on(function (msg) {
+    try {
+      if (!msg || msg.type !== 'state') return;
+      repos = msg.repos || [];
+      cfg = Object.assign(cfg, msg.cfg || {});
+      render();
+    } catch (err) {
+      // ⚠ 这个 try/catch 不是为了"容错"，是为了把异常送出去：
+      //   render 里抛错时页面静默失败，主进程只看到"球没出现"，无从下手。
+      console.error('render failed: ' + (err && err.stack ? err.stack : err));
+    }
+  });
+
+  if (document.fonts && document.fonts.ready) document.fonts.ready.then(measure);
+
+  /* 自测出口：只读，暴露"页面当前认为的状态"。主进程侧的穿透状态在 window.__shellProbe 里合并。 */
+  window.__probe = function () {
+    var p = window.__shellProbe || {};
+    return {
+      orbs: dock.children.length,
+      hot: hot,
+      cardOn: card.classList.contains('on'),
+      lane: p.lane || null,
+      ignoring: typeof p.ignoring === 'boolean' ? p.ignoring : null,
+      win: p.bounds || null,
+    };
+  };
+
+  post('ready', {});
+})();
+</script>
+</body>
+</html>

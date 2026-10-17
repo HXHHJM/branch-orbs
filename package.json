@@ -1,0 +1,139 @@
+{
+  "name": "branch-orbs",
+  "displayName": "Branch Orbs",
+  "description": "码头悬浮球：把工作区仓库收进一列沉在窗口底部的并列小球，悬停即见分支名与改动数。",
+  "version": "0.1.0",
+  "publisher": "heyuying",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other",
+    "Visualization"
+  ],
+  "keywords": [
+    "git",
+    "branch",
+    "orb",
+    "dock",
+    "float"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./src/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "branchOrbs.toggle",
+        "title": "显示/隐藏悬浮球",
+        "category": "Branch Orbs",
+        "icon": "$(circle-large-filled)"
+      },
+      {
+        "command": "branchOrbs.show",
+        "title": "显示悬浮球",
+        "category": "Branch Orbs"
+      },
+      {
+        "command": "branchOrbs.hide",
+        "title": "隐藏悬浮球",
+        "category": "Branch Orbs"
+      },
+      {
+        "command": "branchOrbs.refresh",
+        "title": "刷新",
+        "category": "Branch Orbs",
+        "icon": "$(sync)"
+      },
+      {
+        "command": "branchOrbs.diag",
+        "title": "诊断：导出悬浮球状态",
+        "category": "Branch Orbs"
+      },
+      {
+        "command": "branchOrbs.why",
+        "title": "自检：为什么看不到悬浮球",
+        "category": "Branch Orbs"
+      }
+    ],
+    "configuration": {
+      "title": "Branch Orbs",
+      "properties": {
+        "branchOrbs.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "激活本扩展时自动显示悬浮球。"
+        },
+        "branchOrbs.dock": {
+          "type": "string",
+          "enum": [
+            "bottom",
+            "bottom-left",
+            "bottom-right",
+            "top"
+          ],
+          "enumDescriptions": [
+            "屏幕底边正中（下沉半藏）",
+            "屏幕左下角（下沉半藏）",
+            "屏幕右下角（下沉半藏）",
+            "屏幕顶边正中（上浮半藏）"
+          ],
+          "default": "bottom",
+          "description": "停靠的屏幕边缘。悬停仍从哪个方向探出、展开方向朝屏幕内侧。",
+          "markdownDescription": "停靠的屏幕边。球会朝这条边**下沉**一部分，悬停时探出。\n\n> 侧边竖直一列是另一种形态（球会横着露在窗口边），不在本扩展范围内。"
+        },
+        "branchOrbs.sink": {
+          "type": "number",
+          "default": 0.32,
+          "minimum": 0,
+          "maximum": 0.6,
+          "description": "下沉比例：球半径的多少比例藏在屏幕外。0 = 整个浮在边内，0.5 = 只露一半。"
+        },
+        "branchOrbs.ballSize": {
+          "type": "number",
+          "default": 30,
+          "minimum": 18,
+          "maximum": 56,
+          "description": "球直径（像素）。"
+        },
+        "branchOrbs.gap": {
+          "type": "number",
+          "default": 8,
+          "minimum": 0,
+          "maximum": 32,
+          "description": "并列球之间的间距（像素）。"
+        },
+        "branchOrbs.offset": {
+          "type": "number",
+          "default": 0,
+          "minimum": -2000,
+          "maximum": 2000,
+          "description": "沿边缘方向的偏移（像素），留开 Windows 任务栏/活动块等。"
+        },
+        "branchOrbs.showCard": {
+          "type": "boolean",
+          "default": true,
+          "description": "悬停时显示信息卡（分支名、增删数、最近提交）。关掉只剩球本身，占位极小。"
+        },
+        "branchOrbs.drag": {
+          "type": "boolean",
+          "default": true,
+          "description": "允许拖动小球沿屏幕边缘换位置（拖动后不会自动弹起）。"
+        },
+        "branchOrbs.maxRepos": {
+          "type": "number",
+          "default": 6,
+          "minimum": 1,
+          "maximum": 20,
+          "description": "最多显示多少个仓库球（按工作区仓库顺序取前 N 个）。"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "package": "npx --yes @vscode/vsce package --no-dependencies --allow-missing-repository"
+  },
+  "devDependencies": {}
+}
