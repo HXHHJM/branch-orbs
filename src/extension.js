@@ -556,14 +556,20 @@ function activate(context) {
     lastRefreshAt = now;
     if (refreshing) return refreshing;
     refreshing = (async () => {
+      const T0 = Date.now();
+      const step = (m) => {
+        log('[refresh +' + (Date.now() - T0) + 'ms] ' + m);
+      };
       const c = lastCfg || readCfg();
       const aDir = activeDir();
+      step('start aDir=' + aDir + ' max=' + c.maxRepos);
       let roots = [];
       try {
         roots = await gitModel.discoverRepos(model, { max: c.maxRepos, activeDir: aDir });
       } catch (e) {
         log('discover failed', e.message);
       }
+      step('discover → ' + JSON.stringify(roots));
       const activeRoot = aDir ? gitModel.findGitRoot(aDir) : null;
       /* 没有活动编辑器时（刚打开窗口、焦点在欢迎页）aDir 是 null，
          这时**不能**把所有仓库都标成 isActive=false —— 用户会看到
@@ -576,8 +582,10 @@ function activate(context) {
           const info = await gitModel.readRepo(model, r);
           info.isActive = activeRoot ? r === activeRoot : r === soleRepo;
           repos.push(info);
+          step('readRepo ' + path.basename(r) + ' → ' + info.branch);
         } catch (e) {
           repos.push({ root: r, name: path.basename(r), branch: '?', error: e.message, changed: 0 });
+          step('readRepo ' + path.basename(r) + ' 失败 ' + e.message);
         }
       }
 
@@ -619,7 +627,9 @@ function activate(context) {
 
       /* 主通道空手而归时走兜底 —— 否则用户只看到"没有球"，而内置 git 明明知道分支。 */
       if (merged.length === 0) {
+        step('主通道为空，试 vscode.git 兜底');
         const alt = await reposFromVscodeGit();
+        step('vscode.git 兜底 → ' + (alt ? alt.length + ' 个' : 'null'));
         if (alt && alt.length) {
           const activeRoot2 = aDir ? gitModel.findGitRoot(aDir) : null;
           for (const x of alt) x.isActive = !!activeRoot2 && x.root === activeRoot2;
@@ -635,6 +645,7 @@ function activate(context) {
       if (shell && shell.alive()) shell.send({ type: 'repos', repos: stripHeavy(merged) });
       firstRefreshDone = true;
       renderStatus();
+      step('done repos=' + merged.length + ' shellAlive=' + !!(shell && shell.alive()));
 
       /* 静默失败是最糟的体验：球不出来，用户完全不知道发生了什么。
          这里把两种"必然没球"的原因显式说出来（只提示一次，别反复弹）。 */
@@ -896,9 +907,24 @@ function activate(context) {
 
   // 无论球能不能起来，都把仓库读一遍：豆子需要数据，自检也需要
   rawLog('about to first refresh');
+  /* 5 秒看门狗：如果 refresh 还没回来，说明它卡在某个 await 上了。
+     线上排障时最怕"什么都不发生"，所以这里主动把卡住这件事写进 boot.log ——
+     哪怕最后还是没数据，用户/我们也能一眼看出"是卡住"而不是"没仓库"。 */
+  const firstRefreshWatchdog = setTimeout(() => {
+    rawLog(
+      '⚠ 首次 refresh 已 5s 未返回（可能卡在 vscode.git 兜底或某个 git 子进程）' +
+        '  diagnostic.repos=' + (diagnostic.repos || []).length
+    );
+  }, 5000);
   refresh(true)
-    .then((repos) => rawLog('首次 refresh 完成，repos=' + (repos ? repos.length : 'null')))
-    .catch((e) => rawLog('首次 refresh 失败：' + (e && e.message)));
+    .then((repos) => {
+      clearTimeout(firstRefreshWatchdog);
+      rawLog('首次 refresh 完成，repos=' + (repos ? repos.length : 'null'));
+    })
+    .catch((e) => {
+      clearTimeout(firstRefreshWatchdog);
+      rawLog('首次 refresh 失败：' + (e && e.message) + ' | ' + (e && e.stack ? e.stack.split('\n')[1] : ''));
+    });
 }
 
 function deactivate() {}
