@@ -54,6 +54,33 @@ if (process.platform === 'linux' && process.getuid && process.getuid() === 0) {
   app.commandLine.appendSwitch('no-sandbox');
 }
 
+/* ── 透明窗口在 Wayland 宿主 + XWayland 客户端下必须走软件合成 ──
+   ⚠ 这是"球一直不出现"的最后一层根因，日志证据链：
+       createWindow {"x":0,"y":0,"width":1920,"height":1080}   ← 尺寸算对了
+       after show: visible=true bounds={...1920x1080}          ← Electron 认为显示了
+       XGetWindowAttributes failed for window 1                ← 但 X 上根本没有这个窗口
+       GPU process exited unexpectedly: exit_code=139          ← SIGSEGV，连崩 3 次
+     `_NET_CLIENT_LIST` 里查不到 branch-orbs —— 窗口**从未被 map**。
+     原因：宿主桌面是 Wayland 原生会话（VSCode 自己跑 --ozone-platform=wayland），
+     而壳被我们强制成 x11（XWayland）。这种"Wayland 宿主 + XWayland 客户端"混合形态下
+     Chromium 的 GPU 进程拿不到可用的合成后端，崩溃后 renderer 无法提交首帧，
+     于是 mutter 永远不 map 这个窗口。
+     对策：强制软件渲染。悬浮球本身是纯 CSS（圆 + 径向渐变 + 阴影），
+     软件合成完全够用，帧率不成问题（页面是静止的，只有 hover 时一次 transform 过渡）。
+     顺带把日志里那两条 "Failed to create shader cache" 也消掉。 */
+/* 用 app.disableHardwareAcceleration() 而不是 --disable-gpu 命令行开关：
+   ⚠ 两者的区别非常实际 ——
+     · `--disable-gpu` 会让 Chromium 连 GPU 进程都不启动，
+       Playwright 的 --remote-debugging-pipe 握手会超时（"Process failed to launch!"），
+       自测从此跑不起来，等于为了修一个显示 bug 把回归网拆了。
+     · `app.disableHardwareAcceleration()` 只把合成器切到软件路径
+       （内部就是 --disable-gpu-compositing），GPU 进程照常存在，
+       CDP 握手正常，自测能跑。
+   而且必须放在 app.whenReady() 之前调用才有效，所以写在模块顶层。 */
+if (process.platform === 'linux') {
+  app.disableHardwareAcceleration();
+}
+
 const logFile = process.env.BRANCH_ORBS_LOG || null;
 
 /* ⚠ 踩过的严重坑：日志写死循环，把磁盘灌了 454MB。
@@ -161,12 +188,64 @@ function cfg() {
 /** VSCode 主窗口矩形：由扩展侧上报（壳进程看不到别人的窗口） */
 let anchorWin = null;
 
-function workAreaFor(rect) {
-  if (rect && typeof rect.width === 'number') {
-    const d = screen.getDisplayMatching(rect);
-    return d.workArea;
+/* ── 工作区：**以 X 的 _NET_WORKAREA 为准**，不信 Electron ──
+
+   ⚠ 这是"球跑到屏幕中上部"的最后一颗钉子，实测数据：
+       Electron screen.getPrimaryDisplay().workArea → {x:0, y:0,  width:1920, height:1080}
+       X  _NET_WORKAREA（mutter 真正设的）        → {x:0, y:31, width:1920, height:987}
+     差 31px 顶栏。overlay 窗口按 1080 高铺满后，球被画到 y≈1050 一线；
+     GNOME 顶栏 + 缩放下这 31px 让球整体偏出可视区，
+     看起来就是"球不知道跑哪去了"。
+     根因：XWayland 下 Electron 的 screen API 从 RandR 拿整屏尺寸，
+     没有把 mutter 的 workarea 避让算进去。
+
+   为什么不用 anchorWin 反推：VSCode 主窗口最大化时它的矩形恰好≈工作区，
+     但窗口没最大化时（用户拖成小窗）反推会得到错的值，球会跟着窗口跑。
+
+   实现：壳进程自己是个 Node 进程，没有 xlib，所以 spawn 一个 python 小脚本读。
+     只读一次并缓存（工作区只有在分辨率/顶栏变化时才会变）。
+     读不到就退回 Electron 的 workArea —— 至少 Xorg 会话下是对的。 */
+let cachedWA = null;
+function xWorkArea() {
+  if (cachedWA) return cachedWA;
+  if (process.platform !== 'linux') return null;
+  const script = path.join(__dirname, '..', 'src', 'workarea.py');
+  if (!fs.existsSync(script)) return null;
+  // 依次试几个解释器：扩展自带的、系统 python3
+  const pys = [process.env.BRANCH_ORBS_PY, 'python3', '/usr/bin/python3'].filter(Boolean);
+  for (const py of pys) {
+    try {
+      const out = require('child_process').execFileSync(py, [script], {
+        encoding: 'utf8',
+        timeout: 3000,
+        env: process.env,
+      });
+      const r = JSON.parse((out || '').trim().split('\n').pop() || '{}');
+      if (r && r.ok) {
+        cachedWA = { x: r.x, y: r.y, width: r.width, height: r.height };
+        log('workArea 来源 X _NET_WORKAREA:', JSON.stringify(cachedWA), 'desktop', r.desktop);
+        return cachedWA;
+      }
+      log('workArea 读不到（' + py + '）:', r && r.error);
+    } catch (e) {
+      log('workArea 脚本失败（' + py + '）:', e.message);
+    }
   }
-  return screen.getPrimaryDisplay().workArea;
+  return null;
+}
+
+function workAreaFor(rect) {
+  const d = rect && typeof rect.width === 'number'
+    ? screen.getDisplayMatching(rect)
+    : screen.getPrimaryDisplay();
+  const ew = d.workArea;
+
+  const xw = xWorkArea();
+  if (xw) {
+    // 用 X 的尺寸，但保留 Electron 给的 x 偏移（多显示器时更可靠）
+    return { x: ew.x, y: xw.y, width: xw.width, height: xw.height };
+  }
+  return ew;
 }
 
 /** 窗口尺寸的硬下限：mutter/xcb 会把 <128px 的窗口当成 0×0（球直接消失），
@@ -482,6 +561,62 @@ function hitAt(px, py) {
   return -1;
 }
 
+/* ── "Electron 说显示了，X 上却没这个窗口" ──
+   ⚠ 这是"球一直不出现"里最难查的一种：所有 JS 层证据都正常 ——
+       createWindow 尺寸正确、after show: visible=true、
+       did-finish-load 成功、page probe 拿到 orbs/hasDock、DOM 里有 3 个球…
+     但 X 的 _NET_CLIENT_LIST 里根本没有这个窗口，屏幕上一片空白。
+     实测触发条件：宿主是 Wayland 会话（XDG_SESSION_TYPE=wayland），
+     壳被强制 ozone=x11 走 XWayland，GPU 进程又崩了
+     （XGetWindowAttributes failed + GPU exit_code=139）时必然发生。
+
+     对策：show 之后 1.2s 用 X 反查一次"我这个 PID 有没有 mapped 窗口"，
+     没有就自动降级重试（关硬件加速 → 再不行就报错给扩展侧显示）。
+     不这么做的话，用户只能看到"没有球"，日志全是绿的。 */
+function verifyMapped() {
+  if (process.platform !== 'linux' || !state.win || state.win.isDestroyed()) return;
+  const pid = process.pid;
+  const probe = () => {
+    try {
+      const py = [
+        'import sys, os',
+        'from Xlib import X, display',
+        'd = display.Display(os.environ.get("DISPLAY", ":0"))',
+        'r = d.screen().root',
+        'def walk(w, dep=0):',
+        '    if dep > 4: return []',
+        '    out = []',
+        '    for c in w.query_tree().children:',
+        '        try:',
+        '            pm = c.get_full_property(d.intern_atom("_NET_WM_PID"), X.AnyPropertyType)',
+        '            if pm and pm.value[0] == int(sys.argv[1]) and c.get_attributes().map_state == 2:',
+        '                g = c.get_geometry()',
+        '                out.append([g.x, g.y, g.width, g.height])',
+        '            out += walk(c, dep + 1)',
+        '        except Exception: pass',
+        '    return out',
+        'f = walk(r)',
+        'print("MAPPED" if f else "NOT_MAPPED", f[:1])',
+      ].join('\n');
+      const out = require('child_process')
+        .execFileSync('python3', ['-c', py, String(pid)], { encoding: 'utf8', timeout: 4000 })
+        .trim();
+      log('X map 校验: ' + out);
+      if (out.startsWith('NOT_MAPPED')) {
+        log('⚠ 窗口未映射到 X —— 屏幕上看不到球，尝试软件合成降级');
+        try {
+          app.commandLine.appendSwitch('disable-gpu-compositing');
+          state.win.webContents.reloadIgnoringCache();
+        } catch (_) {}
+        send({ type: 'diag', warn: 'window-not-mapped' });
+      }
+    } catch (e) {
+      log('X map 校验失败(可忽略): ' + e.message);
+    }
+  };
+  setTimeout(probe, 1200);
+}
+
 /* ───────────────────────── 窗口 ───────────────────────── */
 
 function createWindow() {
@@ -626,6 +761,7 @@ function createWindow() {
     try {
       log('after show: visible=' + win.isVisible() + ' bounds=' + JSON.stringify(win.getBounds()));
     } catch (_) {}
+    verifyMapped();
   });
   win.on('closed', () => {
     state.win = null;

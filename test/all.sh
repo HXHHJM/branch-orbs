@@ -56,6 +56,11 @@ run_one "xwin（X11 窗口匹配 + toggle 往返）" \
 run_one "ownerpid（窗口所属主进程 pid 的父链遍历）" \
   "${CLEAN_ENV[@]}" "$NODE" test/ownerpid-selftest.js
 
+# workArea 走 python 读 _NET_WORKAREA：Electron 在 XWayland 下会把整屏当工作区，
+# 靠这个脚本纠正（错了球会跑到屏幕中上部，且日志全绿，所以必须有断言）
+run_one "workarea（EWMH 工作区：顶栏避让）" \
+  "${CLEAN_ENV[@]}" "$PY" test/workarea-selftest.py
+
 run_one "activate（激活/状态栏豆子）" \
   "${CLEAN_ENV[@]}" "$NODE" test/activate-selftest.js
 

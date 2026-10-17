@@ -52,6 +52,9 @@ const CONTENT_TYPES = [
   '<Default Extension=".css" ContentType="text/css"/>',
   '<Default Extension=".vsixmanifest" ContentType="text/xml"/>',
   '<Default Extension=".txt" ContentType="text/plain"/>',
+  // Python 辅助脚本（src/xwin.py、src/workarea.py）。
+  // 漏声明不影响解压，但严格的 VSIX 校验器会拒包，顺手补上。
+  '<Default Extension=".py" ContentType="text/x-python"/>',
   '</Types>',
 ].join('');
 

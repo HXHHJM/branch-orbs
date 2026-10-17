@@ -25,15 +25,18 @@ if [ -z "$VSIX" ] || [ ! -f "$VSIX" ]; then
 fi
 echo "安装包：$VSIX"
 
-# 期望：包内 src/xwin.py 的大小（用来校验装进去的确实是这一版）
-WANT_SIZE=$(/home/hy/.workbuddy/binaries/python/envs/default/bin/python - "$VSIX" <<'PY'
+# 期望：包内几个关键文件的大小（用来校验装进去的确实是这一版）
+sizes() {
+  /home/hy/.workbuddy/binaries/python/envs/default/bin/python - "$VSIX" "$1" <<'PY'
 import sys, zipfile
 with zipfile.ZipFile(sys.argv[1]) as z:
-    info = z.getinfo('extension/src/xwin.py')
-    print(info.file_size)
+    print(z.getinfo('extension/' + sys.argv[2]).file_size)
 PY
-)
-echo "包内 src/xwin.py 大小：$WANT_SIZE 字节"
+}
+WANT_XWIN=$(sizes 'src/xwin.py')
+WANT_WA=$(sizes 'src/workarea.py')
+WANT_MAIN=$(sizes 'shell/main.js')
+echo "包内指纹：xwin.py=$WANT_XWIN  workarea.py=$WANT_WA  main.js=$WANT_MAIN"
 
 # 两个 profile：命令行 code 默认用 ~/.vscode，桌面图标默认用 ~/.config/Code
 PROFILES=("$HOME/.vscode" "$HOME/.config/Code")
@@ -79,19 +82,27 @@ print('  → ' + target)
 PY
 
   # 3) 校验：关键文件必须在，且大小与包内一致
-  F="$UD/extensions/heyuying.branch-orbs-0.1.0/src/xwin.py"
-  if [ -f "$F" ]; then
-    GOT=$(stat -c %s "$F" 2>/dev/null || echo 0)
-    if [ "$GOT" = "$WANT_SIZE" ]; then
-      echo "  ✅ src/xwin.py $GOT 字节，与包内一致"
+  #    用多个文件做指纹，不只盯一个 —— 单文件校验挡不住"新旧版本恰好同大小"，
+  #    也挡不住"只有新加的文件没装进去"（workarea.py 就是本轮新增的，
+  #    漏掉它的症状是球跑回屏幕中上部，和没修一样）。
+  for SPEC in "xwin.py:$WANT_XWIN" "workarea.py:$WANT_WA" "shell/main.js:$WANT_MAIN"; do
+    NAME="${SPEC%%:*}"
+    WANT="${SPEC##*:}"
+    F="$UD/extensions/heyuying.branch-orbs-0.1.0/src/$NAME"
+    [ "$NAME" = "shell/main.js" ] && F="$UD/extensions/heyuying.branch-orbs-0.1.0/shell/main.js"
+    if [ -f "$F" ]; then
+      GOT=$(stat -c %s "$F" 2>/dev/null || echo 0)
+      if [ "$GOT" = "$WANT" ]; then
+        echo "  ✅ $NAME $GOT 字节，与包内一致"
+      else
+        echo "  ❌ $NAME $GOT 字节，期望 $WANT（装进去的是旧版！）"
+        RC=1
+      fi
     else
-      echo "  ❌ src/xwin.py $GOT 字节，期望 $WANT_SIZE（装进去的是旧版！）"
+      echo "  ❌ 缺少 $NAME —— 解压被拦或路径不对"
       RC=1
     fi
-  else
-    echo "  ❌ 缺少 src/xwin.py —— 解压被拦或路径不对"
-    RC=1
-  fi
+  done
 
   # 4) extensions.json 里必须登记了这个扩展，否则 VSCode 根本不扫描这个目录。
   #    ⚠ CLI 的 --install-extension 自己解压时可能留下半成品 <id>.tmp 目录，
