@@ -262,9 +262,19 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
       { names: live.map((d) => d.name) }
     );
     ok(
-      '活动仓库的豆子绑 dotActive（点击开关球）',
+      '活动仓库的豆子绑 dotActive（点击弹信息卡片，不依赖 hover）',
       live.some((d) => ((d.command && d.command.command) || d.command) === 'branchOrbs.dotActive'),
       { commands: live.map((d) => (d.command && d.command.command) || d.command) }
+    );
+
+    /* 状态栏文字必须自带"仓库 @ 分支"。
+       为什么单独断言：用户报过"悬停不显示仓库和分支名"，而 hover 浮层在部分
+       环境根本不出现。文字里带仓库名 = 不悬停也能看到，这是这条兜底路径的
+       唯一保障，退化成只有分支名就等于功能回退。 */
+    ok(
+      '状态栏文字自带"仓库 @ 分支"（不依赖 hover）',
+      live.every((d) => /@/.test(d.text || '')),
+      { texts: live.map((d) => d.text) }
     );
 
     const tooltip = firstLive.tooltip || '';

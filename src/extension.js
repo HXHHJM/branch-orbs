@@ -309,6 +309,63 @@ function activate(context) {
     statusDots = [];
   }
 
+  /** 状态栏文字里用的短仓库名：超过 14 字符就截断加 …，免得挤爆状态栏 */
+  function shortName(name) {
+    const s = String(name || '?');
+    return s.length > 14 ? s.slice(0, 13) + '…' : s;
+  }
+
+  /* 弹仓库信息卡片 —— **不依赖 hover**。
+     为什么需要它：StatusBarItem.tooltip 的浮层要"停住约 1 秒"才出现，
+     而且在远程桌面、某些 Electron 版本、鼠标精灵/自动化环境里可能完全不出现。
+     用户报"悬停没反应"时我们无法远程判断属于哪种，所以给一条**点击必定可见**的路。
+
+     用 QuickPick 而不是 showInformationMessage：
+       QuickPick 能带 detail 多行、能挂按钮、能搜索，而且不会像通知那样
+       在 10 秒后自动消失或被"不再显示"永久静音。 */
+  async function showRepoInfo(rootHint) {
+    const repos = diagnostic.repos || [];
+    if (repos.length === 0) {
+      vscode.window.showInformationMessage('Branch Orbs：还没有识别到任何 git 仓库。');
+      return;
+    }
+    // 指定了 root 就直接展示那一个；否则优先活动仓库
+    const target =
+      (rootHint && repos.find((r) => r.root === rootHint)) || repos.find((r) => r.isActive) || repos[0];
+
+    const lines = [
+      '仓库：' + target.name,
+      '路径：' + target.root,
+      '分支：' + target.branch + (target.isActive ? '   ← 当前文件' : ''),
+    ];
+    if (target.detached) lines.push('（detached HEAD）');
+    if (target.ahead || target.behind) lines.push('领先 ' + target.ahead + ' / 落后 ' + target.behind);
+    lines.push('改动：' + (target.changed || 0) + ' 个文件   +' + (target.added || 0) + ' -' + (target.deleted || 0));
+    if (target.lastCommit) lines.push('最近：' + target.lastCommit.subject + '  (' + target.lastCommit.when + ')');
+    if (target.error) lines.push('⚠ ' + target.error);
+    const wins = diagnostic.windows || [];
+    if (wins.length > 1) lines.push('', '共 ' + wins.length + ' 个 VSCode 窗口在共享状态栏');
+
+    const c = lastCfg || readCfg();
+    const ToggleLabel = (c.enabled === false ? '显示' : '隐藏') + '悬浮球';
+    const items = [
+      { label: '$(circle-large-filled) ' + target.branch, description: target.name, detail: lines.join('\n'), __noop: true },
+      { label: '$(eye) ' + ToggleLabel, description: 'branchOrbs.toggle' },
+      { label: '$(list-unordered) 切换到其他仓库…', description: 'branchOrbs.pick' },
+      { label: '$(sync) 刷新', description: 'branchOrbs.refresh' },
+      { label: '$(stethoscope) 自检（排查问题）', description: 'branchOrbs.why' },
+    ];
+
+    const pick = await vscode.window.showQuickPick(items, {
+      title: 'Branch Orbs · ' + target.name,
+      placeHolder: '仓库信息（第一项是详情，选下面几项可执行操作）',
+      matchOnDetail: true,
+    });
+    if (!pick || pick.__noop) return;
+    const id = String(pick.description || '');
+    if (id.startsWith('branchOrbs.')) await vscode.commands.executeCommand(id);
+  }
+
   /** 一颗豆子的 tooltip：这个仓库的全部信息 */
   function repoLines(r, idx, total) {
     const lines = [
@@ -378,7 +435,14 @@ function activate(context) {
              然后误以为我们的 tooltip 坏了（实测真发生过）。
              所以图标必须和 Git 的 ⑂ 拉开差距，让人不会认错豆子。 */
         const icon = r.error ? '$(warning)' : r.isActive ? '$(circle-large-filled)' : '$(circle-large-outline)';
-        const text = icon + ' ' + r.branch + dirty;
+        /* 状态栏文字里直接带上"仓库名 @ 分支名"。
+           ⚠ 为什么不能只靠 tooltip：悬停浮层要停 ~1 秒才出，而且在部分
+             环境（远程桌面/某些 Electron 版本）会失效。用户报"悬停没反应"时
+             我们没法第一时间判断是哪一种。把关键信息写进文字本身，
+             用户**不悬停也能看到**，tooltip 只作为补充详情。
+           文字不能太长，否则会把状态栏挤爆（VSCode 会自己截断并加 …），
+           所以只放 "仓库 @ 分支"，其余细节仍在 tooltip 里。 */
+        const text = icon + ' ' + shortName(r.name) + ' @ ' + r.branch + dirty;
         makeDot(
           text,
           repoLines(r, i, ordered.length),
@@ -849,10 +913,21 @@ function activate(context) {
     vscode.commands.registerCommand('branchOrbs.show', () => toggle(true)),
     vscode.commands.registerCommand('branchOrbs.hide', () => toggle(false)),
 
-    /* 点当前仓库的豆子 = 切换悬浮球显示/隐藏。
-       单独注册一个显式命令（而不是直接把 'branchOrbs.toggle' 挂到豆子上），
-       是为了让豆子的 tooltip 里能写清"点击显示/隐藏"，也方便以后给豆子加额外动作。 */
-    vscode.commands.registerCommand('branchOrbs.dotActive', () => toggle()),
+    /* 点当前仓库的豆子 = **弹出该仓库的详细信息**。
+       ⚠ 这里改过一次：原来点活动豆子直接 toggle 悬浮球，结果用户点了没反应
+         （球可能本来就没起来，或者飘到屏幕外了）→ 以为扩展坏了。
+         改成弹信息卡片：**不依赖 hover**，点一下就能看到仓库/分支/改动/最近提交，
+         卡片上的按钮再跳到"开关悬浮球"。这样"看信息"和"开关球"两条路都在。 */
+    vscode.commands.registerCommand('branchOrbs.dotActive', async () => {
+      await refresh(true);
+      await showRepoInfo(null);
+    }),
+
+    /* 豆子信息卡片：hover 浮层在部分环境不出现，这是它的可靠替代品 */
+    vscode.commands.registerCommand('branchOrbs.info', async (rootOrRepo) => {
+      await refresh(true);
+      await showRepoInfo(typeof rootOrRepo === 'string' ? rootOrRepo : null);
+    }),
 
     /* 点某颗非活动豆子：跳到那个仓库。
        活动仓库的豆子绑定 toggle（开关悬浮球），因为"当前仓库"就在眼前，不需要再跳。

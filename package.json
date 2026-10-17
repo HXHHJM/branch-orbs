@@ -54,7 +54,12 @@
       },
       {
         "command": "branchOrbs.dotActive",
-        "title": "切换当前仓库的悬浮球（内部）",
+        "title": "查看当前仓库信息（豆子点击）",
+        "category": "Branch Orbs"
+      },
+      {
+        "command": "branchOrbs.info",
+        "title": "查看仓库信息卡片",
         "category": "Branch Orbs"
       },
       {
