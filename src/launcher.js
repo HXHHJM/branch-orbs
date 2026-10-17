@@ -123,7 +123,24 @@ function makeShimApp(root) {
     return alt;
   }
   const pkg = { name: 'branch-orbs', version: '0.1.0', main: path.join(root, 'shell', 'main.js') };
-  fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify(pkg));
+  const file = path.join(dir, 'package.json');
+
+  /* ⚠ shim 里的 main 是**绝对路径**，而 root 会随扩展升级/换 profile 变：
+       · 从 0.1.0 升到 0.2.0 → 旧路径还在（VSCode 不会立刻删），但已经是老代码；
+       · 从 /home/hy/.vscode 换到 /home/hy/.config/Code → 旧路径可能直接不存在，
+         壳启动即 "Cannot find module"，而扩展侧只看到"壳立刻退出"。
+     更隐蔽的是：老路径如果还在，壳会**静默地跑旧代码** ——
+     用户报"改了没效果"，其实是 shim 把人领到上一个版本去了
+     （实测 boot.log 里 launch 的 app 目录还指着一个早就无关的临时工作区路径）。
+     所以每次都重写，并且在 main 指向的文件不存在时补一条 warn 日志。 */
+  try {
+    const cur = fs.readFileSync(file, 'utf8');
+    const curMain = (JSON.parse(cur) || {}).main;
+    if (curMain && curMain !== pkg.main && !fs.existsSync(curMain)) {
+      process.stderr.write('[launcher] shim main 指向已失效路径，已重写: ' + curMain + ' → ' + pkg.main + '\n');
+    }
+  } catch (_) {}
+  fs.writeFileSync(file, JSON.stringify(pkg));
   return dir;
 }
 
