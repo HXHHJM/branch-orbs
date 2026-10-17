@@ -33,14 +33,18 @@
     cursor: default;
   }
 
-  /* dock 居中，宽度由内容决定且**不参与**尺寸决策（尺寸由 dockSize() 直接算） */
+  /* dock 水平位置：默认居中；--dock-shift 由主进程随 state 下发
+     （overlay 模式下窗口铺满工作区，offset/拖动全部改在页面内完成）。
+     bottom-left / bottom-right 停靠时贴对应角，offset 仍沿边平移。 */
   #dock {
-    position: absolute; left: 50%; bottom: 0;
+    position: absolute; left: calc(50% + var(--dock-shift, 0px)); bottom: 0;
     transform: translateX(-50%);
     height: var(--size);
     display: flex; align-items: flex-start; gap: var(--gap);
     width: max-content;
   }
+  body.dock-left #dock { left: calc(12px + var(--dock-shift, 0px)); }
+  body.dock-right #dock { left: auto; right: calc(12px - var(--dock-shift, 0px)); }
   /* ⚠ 下沉（sink）由页面完成，不是把窗口挪到屏幕外：
      X11/mutter 会把窗口钳制在工作区内，挪出去会被拉回来（sink 恒为 0）。
      这里把 dock 整体往下推 --sink，球超出窗口底边的那一段被 overflow 裁掉 ——
@@ -151,6 +155,7 @@
   var cfg = { size: 30, gap: 8, sink: 0.32, showCard: true, dock: 'bottom' };
   var repos = [];
   var hot = -1;
+  var driverHot = false; // 主进程是否接管了悬停判定（overlay 模式一定会）
   var dock = document.getElementById('dock');
   var card = document.getElementById('card');
 
@@ -171,7 +176,10 @@
     root.setProperty('--lift', Math.round(cfg.size * 0.6) + 'px');
     root.setProperty('--sink', sinkPx + 'px');
     document.body.classList.toggle('top', cfg.dock === 'top');
+    document.body.classList.toggle('dock-left', cfg.dock === 'bottom-left');
+    document.body.classList.toggle('dock-right', cfg.dock === 'bottom-right');
     document.body.classList.toggle('sink', sinkPx > 0);
+    root.setProperty('--dock-shift', (lastShift || 0) + 'px');
 
     dock.textContent = '';
     repos.forEach(function (r, i) {
@@ -225,13 +233,17 @@
   }
 
   /* 卡片水平跟随目标球。卡片本来用 left:50% + translateX(-50%) 居中，
-     这里把 --dx 叠加上去，落在"目标球中心"，再夹到窗口内。 */
+     这里把 --dx 叠加上去，落在"目标球中心"，再夹到窗口内。
+     ⚠ 必须用 getBoundingClientRect（含 transform）拿球心：
+       overlay 模式下窗口铺满工作区，dock 还带 --dock-shift 平移，
+       offsetLeft 是"transform 前相对 offsetParent"的值，会算错半个 dock 宽。 */
   function repositionCard() {
     var orb = hot >= 0 ? dock.children[hot] : null;
     if (!orb) { card.style.setProperty('--dx', '0px'); return; }
-    var dx = (orb.offsetLeft + orb.offsetWidth / 2) - dock.offsetWidth / 2;
+    var orbR = orb.getBoundingClientRect();
     var winW = window.innerWidth || 1;
     var cardW = card.offsetWidth || 0;
+    var dx = (orbR.left + orbR.width / 2) - winW / 2;
     if (cardW > 0) {
       var half = cardW / 2 + 6;
       var cx = winW / 2 + dx;                        // 球中心在窗口内的 x
@@ -327,11 +339,16 @@
   });
   document.addEventListener('pointerleave', function () {
     if (hot < 0) return;
+    // 主进程接管悬停时（__orbsHover 被调用过）页面不再自己判"移开"：
+    // 主进程每 32ms 轮询光标，本来就比这个事件准；两边同时判会互相打架
+    // （实测：窗口 input shape 变窄时穿出的 pointerleave 会把刚亮的球立刻熄掉）。
+    if (driverHot) return;
     hot = -1; paintHot(); post('hover', { index: -1 });
   });
   document.addEventListener('pointermove', function (e) {
     /* 球的间隙、卡片区域都不算"在球上" */
     if (hot < 0) return;
+    if (driverHot) return; // 同上：交给主进程
     if (down) return; /* 拖动中不移除 hot，否则上探会自己收回去 */
     var t = orbAt(e.target);
     if (!t) { hot = -1; paintHot(); post('hover', { index: -1 }); }
@@ -365,11 +382,22 @@
   window.addEventListener('contextmenu', function (e) { e.preventDefault(); });
 
   /* ── 来自主进程的状态 ── */
+  var lastShift = 0; // 球列水平偏移（overlay 模式：cfg.offset + 拖动实时量）
   api.on(function (msg) {
     try {
       if (!msg || msg.type !== 'state') return;
       repos = msg.repos || [];
       cfg = Object.assign(cfg, msg.cfg || {});
+      if (typeof msg.shift === 'number') {
+        var moved = msg.shift !== lastShift;
+        lastShift = msg.shift;
+        // 拖动时 offset 不变、shift 实时变：只更新 CSS 变量，避免整树重渲染
+        if (moved && document.documentElement.style.getPropertyValue('--dock-shift')) {
+          document.documentElement.style.setProperty('--dock-shift', lastShift + 'px');
+          repositionCard();
+          return;
+        }
+      }
       render();
     } catch (err) {
       // ⚠ 这个 try/catch 不是为了"容错"，是为了把异常送出去：
@@ -379,6 +407,22 @@
   });
 
   if (document.fonts && document.fonts.ready) document.fonts.ready.then(measure);
+
+  /* ── 悬停入口（主进程驱动）─────────────────────────────
+     overlay 模式下页面收不到 pointer 事件（窗口 input shape 只留球带 +
+     forward 在 Linux 不可靠），所以"指针在哪个球上"由主进程轮询光标算出，
+     再调这个函数。它等价于原来的 pointerover/pointermove 逻辑：
+       index >= 0 → 该球 hot；index = -1 → 全部取消。
+     页面自己的 pointer 监听仍然保留（非 overlay 平台照常工作）。 */
+  window.__orbsHover = function (m) {
+    var i = m && typeof m.index === 'number' ? m.index : -1;
+    if (i === hot) return;
+    driverHot = true; // 从此悬停判定权归主进程
+    hot = i;
+    paintHot();
+    if (i >= 0) repositionCard();
+    post('hover', { index: i });
+  };
 
   /* 自测出口：只读，暴露"页面当前认为的状态"。主进程侧的穿透状态在 window.__shellProbe 里合并。 */
   window.__probe = function () {

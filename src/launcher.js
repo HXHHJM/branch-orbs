@@ -199,6 +199,14 @@ function spawnEnv(root, opts) {
   const env = { ...process.env };
   delete env.ELECTRON_RUN_AS_NODE;
   delete env.NODE_OPTIONS;
+  /* root 下 Chromium 在 C++ 层（electron_main_delegate.cc:225）直接 FATAL：
+       "Running as root without --no-sandbox is not supported"
+     这个检查发生在**任何 JS 执行之前**，main.js 里的 appendSwitch('no-sandbox')
+     来不及生效。ELECTRON_DISABLE_SANDBOX 是 Electron 在同一 C++ 路径上读的
+     环境变量，能赶上。实测 root 下没有它壳必死（SIGTRAP），有则正常启动。 */
+  if (process.getuid && process.getuid() === 0) {
+    env.ELECTRON_DISABLE_SANDBOX = '1';
+  }
   const tmp = (opts && opts.tmpdir) || persistentTmp(root);
   env.BRANCH_ORBS_HTML = path.join(root, 'shell', 'orbs.html');
   env.BRANCH_ORBS_USER_DATA = (opts && opts.userData) || path.join(os.homedir(), '.branch-orbs', 'shell-ud');

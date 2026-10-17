@@ -92,9 +92,69 @@ const CFG = { dock: 'bottom', size: 30, gap: 8, sink: 0.32, offset: 0, showCard:
 
   const probe = () => page.evaluate(() => window.__probe());
 
+  /* ── 真实指针驱动（overlay 模式必须用它，不能用 page.mouse）──
+     overlay 窗口铺满全屏：lane 切到 hot 后窗口停止穿透，
+     **真实 X 指针**（测试机里静止在某处）进入窗口并触发 pointermove，
+     页面判定"不在球上"→ 取消 hover。合成事件与真实指针打架，hover 永远稳不住。
+     对策：把真实指针搬到球心，整条链路走真实输入。
+
+     ⚠ 三个坑（逐个踩过）：
+     1) python-xlib 的 warp_pointer 签名是
+        warp_pointer(src_window, src_x, src_y, src_width, src_height, dst_x, dst_y)
+        —— 全是位置参数，写成 dst_x=/dst_y= 关键字会抛 TypeError。
+     2) XWarpPointer **在这个会话里完全无效**：调用不报错、sync 也成功，
+        但 query_pointer 立刻回读仍是 (0,0)。
+        实测只有 XTEST 扩展的 fake_input(MotionNotify) 能搬动指针
+        （回读 700,500 精确命中）。所以这里走 XTEST，不走 warp。
+     3) 不能用 translate_coords(root, 0, 0) 求窗口原点：overlay 铺满整屏时
+        实测得到 (-933,-960) 这种负值。改用 get_geometry() 的 x/y。 */
+  const cp = require('child_process');
+  const PYX = '/home/hy/.workbuddy/binaries/python/envs/default/bin/python';
+  const warpScript = path.join(TMP, 'warp-pointer.py');
+  fs.writeFileSync(
+    warpScript,
+    [
+      'import sys, os, json',
+      'from Xlib import X, display',
+      'from Xlib.ext import xtest',
+      'd=display.Display(os.environ.get("DISPLAY",":0"))',
+      'root=d.screen().root',
+      'fx, fy = float(sys.argv[1]), float(sys.argv[2])',
+      'p=root.get_full_property(d.intern_atom("_NET_CLIENT_LIST"), X.AnyPropertyType)',
+      'out={"ok":False,"scan":[]}',
+      'for wid in (p.value if p else []):',
+      '    w=d.create_resource_object("window",wid)',
+      '    cls=w.get_wm_class() or ("","")',
+      '    name=((cls[0] or "")+(cls[1] or "")).lower()',
+      '    g=w.get_geometry()',
+      '    out["scan"].append({"name":name,"w":g.width,"h":g.height})',
+      '    if "branch-orbs" in name:',
+      '        px=int(g.x+fx*g.width); py=int(g.y+fy*g.height)',
+      '        xtest.fake_input(d, X.MotionNotify, x=px, y=py, detail=0, root=root)',
+      '        d.flush(); d.sync()',
+      '        q=root.query_pointer()',
+      '        out.update({"ok":True,"px":px,"py":py,"now":[q.root_x,q.root_y],"win":[g.x,g.y,g.width,g.height]})',
+      '        break',
+      'print(json.dumps(out))',
+    ].join('\n')
+  );
+  const warpToViewport = async (vx, vy) => {
+    const vp = await page.evaluate(() => [window.innerWidth, window.innerHeight]);
+    const out = cp.execFileSync(PYX, [warpScript, String(vx / vp[0]), String(vy / vp[1])], { encoding: 'utf8', timeout: 5000 });
+    const r = JSON.parse((out || '').trim().split('\n').pop() || '{}');
+    if (!r.ok) throw new Error('warp 失败：找不到 branch-orbs X 窗口 ' + JSON.stringify(r.scan || []));
+    return r;
+  };
+
   const g0 = await diag();
   ok('壳只开了一个窗口', g0.count === 1, g0.count);
-  ok('窗口已显示', g0.vis === true);
+  // overlay 模式下窗口启动即全工作区尺寸，show 是异步的 —— 轮询等到可见为止
+  let vis = g0.vis;
+  for (let i = 0; i < 20 && !vis; i++) {
+    await page.waitForTimeout(300);
+    vis = (await diag()).vis;
+  }
+  ok('窗口已显示', vis === true);
   ok('显示器缩放被读到', typeof g0.scale === 'number', { scale: g0.scale, screen: [g0.wa.width, g0.wa.height] });
 
   await sendState();
@@ -126,9 +186,11 @@ const CFG = { dock: 'bottom', size: 30, gap: 8, sink: 0.32, offset: 0, showCard:
   const waCx = g1.wa.x + g1.wa.width / 2;
   ok('静止态：水平居中于屏幕', Math.abs(cx - waCx) <= 2, { cx, waCx });
 
-  // ── 3) 窗口小，不挡编辑器 ──
-  ok('静止态：窗口远窄于屏幕', g1.b.width < 400, { w: g1.b.width, screenW: g1.wa.width });
-  ok('静止态：窗口高度 ≈ 球高', g1.b.height < 80, { h: g1.b.height });
+  // ── 3) overlay 模型：窗口铺满工作区，定位不再依赖 setBounds ──
+  //    （Wayland 不允许客户端定位窗口；mutter/XWayland 对小窗口的位置映射也不可靠，
+  //      所以 Linux 上窗口直接铺满工作区，球由页面画在工作区底边）
+  ok('静止态（overlay）：窗口铺满工作区宽', g1.b.width >= g1.wa.width - 2, { w: g1.b.width, screenW: g1.wa.width });
+  ok('静止态（overlay）：窗口铺满工作区高', g1.b.height >= g1.wa.height - 2, { h: g1.b.height, screenH: g1.wa.height });
 
   // ── 4) 球的尺寸/间距/配色 ──
   const orbs = await page.$$eval('.orb', (els) =>
@@ -147,10 +209,10 @@ const CFG = { dock: 'bottom', size: 30, gap: 8, sink: 0.32, offset: 0, showCard:
   ok('静止态：穿透开启', idle.ignoring === true, idle);
   ok('静止态：lane = idle', idle.lane === 'idle', idle.lane);
 
-  // ── 6) 悬停 ──
+  // ── 6) 悬停（真实指针）──
   const t = orbs[1];
-  await page.mouse.move(t.x + t.w / 2, t.y + t.h / 2, { steps: 3 });
-  await page.waitForTimeout(600);
+  await warpToViewport(t.x + t.w / 2, t.y + t.h / 2);
+  await page.waitForTimeout(700);
   const hov = await probe();
   const card = await page.$eval('#card', (e) => ({
     on: e.classList.contains('on'), w: e.offsetWidth, h: e.offsetHeight,
@@ -165,11 +227,11 @@ const CFG = { dock: 'bottom', size: 30, gap: 8, sink: 0.32, offset: 0, showCard:
   ok('悬停：取消穿透（球能点）', hov.ignoring === false, hov);
   ok('悬停：lane = hot', hov.lane === 'hot', hov.lane);
 
-  // ── 7) 窗口为卡片让位，卡片整体在屏内 ──
+  // ── 7) overlay：窗口尺寸恒定（不再为卡片变高），卡片整体在屏内 ──
   const g2 = await diag();
-  ok('悬停：窗口变高容纳卡片', g2.b.height > g1.b.height + 20, { idleH: g1.b.height, hotH: g2.b.height, cardH: card.h });
-  ok('悬停：窗口变宽容纳卡片', g2.b.width >= card.w, { winW: g2.b.width, cardW: card.w });
-  ok('悬停：窗口顶边不越出屏幕', g2.b.y >= g2.wa.y, { winY: g2.b.y, waY: g2.wa.y });
+  ok('悬停（overlay）：窗口尺寸不变', g2.b.height === g1.b.height && g2.b.width === g1.b.width,
+     { idleH: g1.b.height, hotH: g2.b.height });
+  ok('悬停：卡片完整落在窗口内', card.h > 0 && card.w > 0 && card.h < g1.b.height, { cardW: card.w, cardH: card.h });
   // 悬停时被悬停的那颗球本来就要上探（-lift），所以只检查"没被悬停的球"仍保持下沉。
   // 被悬停的那颗只要确认它确实抬起来了（比静止位置更靠上）。
   const hotGeom = await page.$$eval('.orb', (els) => {
@@ -187,9 +249,9 @@ const CFG = { dock: 'bottom', size: 30, gap: 8, sink: 0.32, offset: 0, showCard:
      hotGeom.some((o) => o.hot && o.bottomOverflow < sinkPx - 5),
      hotGeom.filter((o) => o.hot).map((o) => o.bottomOverflow));
 
-  // ── 8) 移开回落 ──
-  await page.mouse.move(2, 2, { steps: 3 });
-  await page.waitForTimeout(600);
+  // ── 8) 移开回落（真实指针挪到屏幕角落）──
+  await warpToViewport(2, 2);
+  await page.waitForTimeout(700);
   const g3 = await diag();
   const back = await probe();
   ok('移开：回到静止尺寸', Math.abs(g3.b.height - g1.b.height) <= 2, { idle: g1.b.height, after: g3.b.height });
@@ -199,10 +261,10 @@ const CFG = { dock: 'bottom', size: 30, gap: 8, sink: 0.32, offset: 0, showCard:
   // ── 9) 反复进出 20 次：窗口不许"发胖" ──
   const b9 = (await diag()).b;
   for (let i = 0; i < 20; i++) {
-    await page.mouse.move(t.x + t.w / 2, t.y + t.h / 2);
-    await page.waitForTimeout(35);
-    await page.mouse.move(2, 2);
-    await page.waitForTimeout(35);
+    await warpToViewport(t.x + t.w / 2, t.y + t.h / 2);
+    await page.waitForTimeout(60);
+    await warpToViewport(2, 2);
+    await page.waitForTimeout(60);
   }
   await page.waitForTimeout(500);
   const g4 = await diag();
@@ -237,12 +299,23 @@ const CFG = { dock: 'bottom', size: 30, gap: 8, sink: 0.32, offset: 0, showCard:
   const gl = await diag();
   ok('bottom-left：窗口左边缘贴工作区', Math.abs(gl.b.x - gl.wa.x) <= 2, { x: gl.b.x, waX: gl.wa.x });
 
-  // ── 11) offset ──
+  // ── 11) offset：overlay 模式下由页面内平移完成（窗口不动）──
+  const orbCx0 = await page.$$eval('.orb', (els) => {
+    const r = els[0].getBoundingClientRect();
+    return r.x + r.width / 2;
+  });
   await sendState({ ...CFG, offset: -300 });
   await page.waitForTimeout(700);
   const go = await diag();
-  ok('offset=-300 → 整体左移 300', Math.abs((go.b.x + go.b.width / 2) - (waCx - 300)) <= 2,
-     { center: go.b.x + go.b.width / 2, want: waCx - 300 });
+  ok('offset=-300：窗口不动（overlay）', go.b.width === g1.b.width && go.b.height === g1.b.height,
+     { w: go.b.width, h: go.b.height });
+  const orbCx1 = await page.$$eval('.orb', (els) => {
+    const r = els[0].getBoundingClientRect();
+    return r.x + r.width / 2;
+  });
+  ok('offset=-300 → 球列整体左移 300', Math.abs((orbCx1 - orbCx0) - (-300)) <= 4,
+     { delta: +(orbCx1 - orbCx0).toFixed(1), want: -300 });
+  await sendState();
 
   // ── 12) 无脚本错误 ──
   ok('页面无 JS 错误', pageErrors.length === 0, pageErrors.slice(0, 3));
@@ -256,7 +329,7 @@ const CFG = { dock: 'bottom', size: 30, gap: 8, sink: 0.32, offset: 0, showCard:
   await page.waitForTimeout(450);
   await page.screenshot({ path: path.join(shots, 'ball-idle.png') });
   const oc = await page.$$eval('.orb', (els) => els.map((e) => { const r = e.getBoundingClientRect(); return [r.x + r.width / 2, r.y + r.height / 2]; }));
-  if (oc[0]) await page.mouse.move(oc[0][0], oc[0][1], { steps: 3 });
+  if (oc[0]) await warpToViewport(oc[0][0], oc[0][1]);
   await page.waitForTimeout(550);
   await page.screenshot({ path: path.join(shots, 'ball-hover.png') });
 

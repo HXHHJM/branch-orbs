@@ -20,7 +20,19 @@ if (process.env.BRANCH_ORBS_USER_DATA) {
   app.setPath('userData', process.env.BRANCH_ORBS_USER_DATA);
 }
 
-app.commandLine.appendSwitch('ozone-platform-hint', 'auto');
+/* ⚠ 必须强制 X11，绝不能用 auto（auto 会选中 Wayland）：
+     用户桌面是 GNOME Wayland 会话时，ozone-platform-hint=auto 让壳跑在
+     Wayland 后端上。而 **Wayland 协议不允许客户端给窗口定位**——
+     setBounds 传的 x/y 会被合成器无视，窗口被摆到它想放的地方
+     （实测球出现在屏幕中上部而不是沉在底边）。
+     更坑的是 Electron 的 getBounds() 返回的是"请求值"，
+     日志里 bounds=936,1030 看起来全对，视觉上完全不对。
+     XWayland 下 X11 客户端可以自定位置（ConfigureRequest），mutter 会尊重。
+     可用 BRANCH_ORBS_OZONE=wayland 覆盖（纯 Wayland 无 XWayland 的环境）。 */
+app.commandLine.appendSwitch(
+  'ozone-platform',
+  process.env.BRANCH_ORBS_OZONE || 'x11'
+);
 
 /* ── 关键开关：必须用 appendSwitch，不能靠命令行 ──
    ⚠ 这条是本轮排查的核心教训。把 --no-sandbox / --disable-dev-shm-usage
@@ -123,7 +135,10 @@ const state = {
   cfg: null,
   drag: null,
   dragPreview: null, // 拖动时的临时窗口位置
+  dragShift: 0, // overlay 模式：拖动时球的实时水平偏移（叠加在 cfg.offset 上）
   lastRect: null,
+  hitIdx: -1, // 轮询算出的"光标压在第几个球上"（-1 = 不在任何球上）
+  ignoring: true,
   repaintTimer: null,
   hideMenus: [],
   tray: null,
@@ -179,10 +194,26 @@ function anchors() {
 
   const vertical = c.dock === 'bottom' || c.dock === 'top';
   const wide = Math.max(dockW, cardW);
+
+  /* ── Linux：全屏覆盖层模式（本轮"球跑屏幕中间"的根治方案） ──
+     现象：Electron setBounds(936,1030) 底部正中，球却出现在屏幕中上部。
+     原因：用户桌面是 GNOME Wayland 会话，ozone=auto 时壳跑在 Wayland 后端，
+       而 **Wayland 协议不允许客户端给窗口定位**，位置由合成器决定；
+       即使强制 X11（XWayland），mutter 对小窗口的位置映射同样不可靠
+       （实测 setBounds(806,830) 后 X 报告的实际位置是 (-933,-960)）。
+     对策：**窗口直接铺满整个工作区**（透明 + 点击穿透），
+       球由页面画在工作区底边/顶边 —— 窗口位置天然正确，
+       彻底不依赖任何 setBounds 定位。水平偏移（offset/拖动）改由页面内完成。
+     副作用控制：点击穿透由页面 hover 事件驱动（球上才接收点击），
+       空白区域始终 setIgnoreMouseEvents(true,{forward:true})，不挡下层应用。 */
+  const OVERLAY = process.platform === 'linux';
+  const shift = Math.round((c.offset || 0) + (state.dragShift || 0));
+
   // 球探出需要的额外高度由 LIFT 提供，但 dockH 之外还要留出 LIFT，
   // 否则悬停时球会被窗口顶边裁掉。同时卡片带也要算进去。
-  const winW = Math.max(MIN_WIN_W, Math.round(wide) + 2);
-  const winH = Math.max(MIN_WIN_H, Math.round(dockH + LIFT + cardH) + 1);
+  // （overlay 模式下窗口 = 整个工作区，这两个约束天然满足）
+  const winW = OVERLAY ? wa.width : Math.max(MIN_WIN_W, Math.round(wide) + 2);
+  const winH = OVERLAY ? wa.height : Math.max(MIN_WIN_H, Math.round(dockH + LIFT + cardH) + 1);
 
   // ⚠ X11（mutter）会把窗口裁到不会被工作区边吃掉的位置：
   //   把窗口放到工作区下方之外，它会被"拉回来"贴在底边上，
@@ -192,7 +223,10 @@ function anchors() {
   //   视觉等价，且完全不受 WM 的钳制。
   let winX;
   let winY;
-  if (vertical) {
+  if (OVERLAY) {
+    winX = wa.x;
+    winY = wa.y;
+  } else if (vertical) {
     winX = Math.round(wa.x + (wa.width - winW) / 2 + c.offset);
     winX = Math.min(Math.max(winX, wa.x), Math.max(wa.x, wa.x + wa.width - winW));
     winY = c.dock === 'top'
@@ -225,10 +259,32 @@ function anchors() {
     cardTop = Math.round(cardBottom - cardH);
   }
 
+  // dock 的水平范围（窗口内坐标）：laneAt / hitAt 的横向门禁。
+  // overlay 模式下窗口铺满工作区，热带不能再横贯全宽（否则整条底部
+  // 都会拦鼠标），必须收窄到球列真实占用的那一段。
+  let dockL;
+  if (OVERLAY && c.dock === 'bottom-right') dockL = winW - 12 - dockW + shift;
+  else if (OVERLAY && c.dock === 'bottom-left') dockL = 12 + shift;
+  else dockL = (winW - dockW) / 2 + 6 + shift;
+
   // 被屏幕边缘吃掉多少（下沉时底边那一段在屏幕外）
   const top = Math.max(winY, wa.y);
   const bottom = Math.min(winY + winH, wa.y + wa.height);
   const visibleH = Math.max(1, bottom - top);
+
+  /* input region（窗口内矩形，X Shape 用）：静止态只有这一块能接收鼠标。
+     横向 = 球列 ± 8px 余量；纵向 = 球带（球本体 + 上探余量）。
+     没有它，overlay 会把整个工作区的点击全部吃掉 —— 用户点桌面任何地方都没反应。
+     ⚠ 纵向不能只用"球本体 30px"：悬停时球要上探 LIFT，而切 hot 的那一瞬间
+       指针可能已经在球的上半部分，收窄的区域会让 pointerdown 打在窗外。 */
+  const regL = Math.round(dockL - 8);
+  const regT = Math.round(Math.min(hotTop, c.dock === 'top' ? 0 : winH - dockH - LIFT));
+  const region = {
+    x: regL,
+    y: Math.max(0, regT),
+    width: Math.round(dockW + 16),
+    height: Math.max(1, Math.round(winH - Math.max(0, regT))),
+  };
 
   return {
     win: { x: winX, y: winY, width: winW, height: winH },
@@ -236,11 +292,14 @@ function anchors() {
       dock: {
         top: c.dock === 'top' ? 0 : winH - Math.round(dockH),
         bottom: c.dock === 'top' ? Math.round(dockH) : winH,
+        left: Math.round(dockL),
+        right: Math.round(dockL + dockW),
       },
       hot: { top: hotTop, bottom: hotBottom },
       card: { top: cardTop, bottom: cardBottom },
     },
-    metrics: { D, R, sinkPx, lift: LIFT, dockW, dockH, cardW, cardH, gap: c.gap, winW, winH, wide },
+    region,
+    metrics: { D, R, sinkPx, lift: LIFT, dockW, dockH, cardW, cardH, gap: c.gap, winW, winH, wide, shift, overlay: OVERLAY },
     workArea: wa,
     visible: { top: top - winY, height: visibleH },
     occluded: Math.max(0, winH - visibleH),
@@ -251,8 +310,7 @@ function setLane(l) {
   if (l === state.lane) return;
   state.lane = l;
   if (!state.win || state.win.isDestroyed()) return;
-  if (l === LANE_IDLE) state.win.setIgnoreMouseEvents(true, { forward: true });
-  else state.win.setIgnoreMouseEvents(false);
+  applyInputShape(l);
   // Linux 上 BrowserWindow 没有 isIgnoringMouseEvents()，自己记账给诊断用
   state.ignoring = l === LANE_IDLE;
   log('lane →', l);
@@ -277,14 +335,129 @@ function pushProbe() {
 function laneAt(px, py) {
   const a = anchors();
   const b = a.bands;
-  if (py >= b.hot.top - 2 && py <= b.hot.bottom + 2) return LANE_HOT;
+  if (py >= b.hot.top - 2 && py <= b.hot.bottom + 2 && px >= b.dock.left - 8 && px <= b.dock.right + 8) return LANE_HOT;
   if (cfg().showCard && py >= b.card.top - 2 && py <= b.card.bottom + 2) return LANE_CARD;
   return LANE_IDLE;
 }
 
+/* ─────────── 原生命中轮询（overlay 模式的"悬停"就靠它）───────────
+
+   症状：overlay 铺满全屏后，把真实指针搬到球心，页面 **一个 pointer 事件都收不到**
+   （实测 document 上捕 pointermove/pointerover/mousemove，全空），
+   于是悬停永不触发、卡片永不弹。
+
+   根因有两层，缺一不可：
+     ① `setIgnoreMouseEvents(true, {forward:true})` 的 forward 在 Linux 上不可靠 ——
+        它在 X11 下靠窗口 input shape 置空来实现"穿透"，
+        而 input shape 为空时，指针事件根本不会投递到这个窗口，
+        Chromium 再想"转发"也没有素材。容器/合成器环境下连 shape 操作本身都可能被忽略。
+     ② overlay 覆盖整个工作区，如果不定制 input shape，它会把所有点击吃掉（挡死下层应用）。
+
+   对策（Linux）：**完全不走 forward**。
+     · 窗口 input shape 只保留"球带"那一小块矩形（xwin.setInputRegion），
+       其余区域对 X 来说根本不存在 → 天然穿透下层应用，且不需要 forward。
+     · 悬停判定改由主进程用 screen.getCursorScreenPoint() 轮询（30fps），
+       命中球带就 setIgnoreMouseEvents(false)（全窗接收），指针移开再恢复。
+   为什么轮询不丢精度：命中区就是球本身（30~35px），指针速度再快也会在离开前
+   至少落在它上一帧里一次；30fps 下 900px/s 的手速也只会跳过 30px —— 正好一个球。 */
+const POLL_MS = 32;
+let pollTimer = null;
+let pollStale = 0;
+
+function cursorInWin() {
+  if (!state.win || state.win.isDestroyed()) return null;
+  const p = screen.getCursorScreenPoint();
+  const r = state.lastRect || state.win.getBounds();
+  return { x: p.x - r.x, y: p.y - r.y, screen: p, rect: r };
+}
+
+function pollHit() {
+  if (!state.win || state.win.isDestroyed() || !state.repos.length) return;
+  const c = cursorInWin();
+  if (!c) return;
+  const a = anchors();
+  const inside = c.x >= 0 && c.y >= 0 && c.x <= a.win.width && c.y <= a.win.height;
+  const idx = inside ? hitAt(c.x, c.y) : -1;
+  const lane = inside ? laneAt(c.x, c.y) : LANE_IDLE;
+  const pr = state.win.webContents;
+  if (!pr || pr.isDestroyed()) return;
+
+  // ① 球的 hot 态：主进程判定后直接告诉页面（页面自己收不到 pointer 事件）
+  if (idx !== state.hitIdx) {
+    state.hitIdx = idx;
+    state.hot = idx;
+    pr.executeJavaScript(
+      'window.__orbsHover && window.__orbsHover(' + JSON.stringify({ index: idx, x: Math.round(c.x), y: Math.round(c.y) }) + ');true'
+    ).catch(() => {});
+    send({ type: 'hover', index: idx });
+  }
+  // ② 输入区域：球上要能被点，别处要能穿透下层（Linux 靠 input shape 精确圈定）
+  const wantIgnore = lane === LANE_IDLE;
+  if (wantIgnore !== state.ignoring) {
+    state.ignoring = wantIgnore;
+    state.lane = lane;
+    applyInputShape(lane);
+    log('poll lane →', lane, 'idx', idx, 'ignore', wantIgnore);
+    pushProbe();
+  } else if (lane !== state.lane) {
+    state.lane = lane;
+    pushProbe();
+  }
+}
+
+/* 把"哪里能接收鼠标"同步给窗口。
+   Linux 走 Electron 原生的 setInputRegion（X11 input shape），
+   非 Linux 走 setIgnoreMouseEvents（macOS/Windows 支持 forward，没有 shape 问题）。
+
+   ⚠ 这里**只允许"整窗接收"与"球带接收"两态，绝不允许"整窗穿透"**。
+     踩过的坑：页面里还留着 pointerleave/pointermove 监听（非 overlay 平台要用），
+     一旦把 input region 清空，窗口边缘穿过指针会立刻产生 pointerleave，
+     页面就 post('hover',{index:-1}) 把 hot 撤掉 —— 球刚亮起来就自己灭，
+     主进程随后又把它点亮，来回抖。日志里表现为
+       poll lane → hot idx 1 ignore false
+       lane → idle      ← 页面自己退的
+       lane → hot
+     所以 idle 态的 input region 始终保留球带矩形（球带本来就不挡下层），
+     "不挡下层"由球带之外的区域天然缺失保证，不靠清空整个 region。 */
+function applyInputShape(lane) {
+  if (!state.win || state.win.isDestroyed()) return;
+  const w = state.win;
+  const idle = lane === LANE_IDLE;
+  try {
+    if (process.platform === 'linux') {
+      // ignore 恒为 false：靠 input shape 精确圈定可交互区域，比 ignore 更细。
+      w.setIgnoreMouseEvents(false);
+      if (typeof w.setInputRegion === 'function') {
+        w.setInputRegion(idle ? anchors().region : null);
+      }
+    } else {
+      w.setIgnoreMouseEvents(idle, idle ? { forward: true } : undefined);
+    }
+  } catch (e) {
+    log('applyInputShape:', e.message);
+  }
+}
+
+function startPoll() {
+  if (pollTimer || process.platform !== 'linux') return;
+  pollTimer = setInterval(() => {
+    try {
+      pollHit();
+    } catch (e) {
+      if (pollStale++ < 3) log('poll error:', e.message);
+    }
+  }, POLL_MS);
+  if (pollTimer.unref) pollTimer.unref();
+}
+
+function stopPoll() {
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = null;
+}
+
 /** 把窗口内的点换算成"命中第几个球"，供诊断与自测用。
     球的几何必须和 orbs.html 的 CSS 完全一致：
-      · dock 在窗口内水平居中，宽 = m.dockW
+      · dock 在窗口内水平居中（overlay 模式加 shift 偏移），宽 = m.dockW
       · 球顶贴窗口底边往上 dockH - padBottom，即球占 [winH-dockH, winH-padBottom]
       · top 停靠时镜像到窗口顶边 */
 function hitAt(px, py) {
@@ -294,7 +467,7 @@ function hitAt(px, py) {
   const m = a.metrics;
   const padBottom = 3;
   const lift = cfg().size * 0.62;
-  const dockLeft = (m.winW - m.dockW) / 2 + 6;
+  const dockLeft = a.bands.dock.left;
   const isTop = c.dock === 'top';
   // 球位（窗口内坐标，未下沉）：bottom 停靠时球贴在窗口底边上方 dockH 那一条里
   const orbTop = isTop ? 0 : m.winH - m.dockH;
@@ -355,9 +528,10 @@ function createWindow() {
   } catch (e) {
     log('alwaysOnTop/workspace:', e.message);
   }
-  win.setIgnoreMouseEvents(true, { forward: true });
+  applyInputShape(LANE_IDLE);
   state.lane = LANE_IDLE;
   state.ignoring = true;
+  startPoll();
 
   // 自测驱动口：只在 BRANCH_ORBS_TEST=1 时挂上。
   // 外部（Playwright）没法往 stdin 里写字，所以留一个等价的注入点 ——
@@ -512,7 +686,8 @@ function pushState() {
   const c = cfg();
   // ⚠ 必须带 type:'state' —— 页面侧 api.on 的第一行就是 `if (msg.type !== 'state') return;`。
   //   漏了它，页面收到消息后静默返回，球永远不出现，而且不报任何错。
-  state.win.webContents.send('state', { type: 'state', repos: state.repos, cfg: c });
+  //   shift：overlay 模式下球列的水平偏移（cfg.offset + 拖动实时量），页面据此平移 dock。
+  state.win.webContents.send('state', { type: 'state', repos: state.repos, cfg: c, shift: Math.round((c.offset || 0) + (state.dragShift || 0)) });
 }
 /* ───────────────────────── 页面事件 ───────────────────────── */
 
@@ -557,8 +732,13 @@ function onPage(channel, m) {
   }
   if (channel === 'dragstart') {
     if (!cfg().drag) return;
-    const b = state.win.getBounds();
-    state.drag = { x0: b.x, y0: b.y, px0: null, py0: null, wa: anchors().workArea };
+    if (process.platform === 'linux') {
+      // overlay 模式：窗口不动，拖动改的是"球列在窗口内的水平偏移"
+      state.drag = { shift0: (cfg().offset || 0), px0: null, py0: null, wa: anchors().workArea };
+    } else {
+      const b = state.win.getBounds();
+      state.drag = { x0: b.x, y0: b.y, px0: null, py0: null, wa: anchors().workArea };
+    }
     setLane(LANE_HOT);
     return;
   }
@@ -569,6 +749,14 @@ function onPage(channel, m) {
       d.px0 = m.screenX;
       d.py0 = m.screenY;
     }
+    if (process.platform === 'linux') {
+      const dx = Math.round(m.screenX - d.px0);
+      const half = Math.round(d.wa.width / 2);
+      state.dragShift = Math.round(Math.min(Math.max(d.shift0 + dx, -half), half));
+      // 实时把偏移推给页面（窗口不动，页面里球跟着走）
+      pushState();
+      return;
+    }
     const b = state.win.getBounds();
     const nx = Math.round(Math.min(Math.max(d.x0 + (m.screenX - d.px0), d.wa.x - 40), d.wa.x + d.wa.width - 40));
     const ny = Math.round(Math.min(Math.max(d.y0 + (m.screenY - d.py0), d.wa.y - 40), d.wa.y + d.wa.height - 40));
@@ -577,8 +765,17 @@ function onPage(channel, m) {
     return;
   }
   if (channel === 'dragend') {
-    const prev = state.dragPreview;
     const d = state.drag;
+    if (process.platform === 'linux') {
+      // dragShift = shift0(=dragstart 时的 cfg.offset) + 拖动增量，即拖完的总偏移
+      const total = Math.round(state.dragShift);
+      state.drag = null;
+      state.dragShift = 0;
+      if (d) send({ type: 'dragcommit', offset: total });
+      pushState();
+      return;
+    }
+    const prev = state.dragPreview;
     state.drag = null;
     state.dragPreview = null;
     if (prev && d) {
