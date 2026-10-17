@@ -58,6 +58,18 @@
   }
   body.top.sink #dock { top: calc(-1 * var(--sink)); }
 
+  /* ── 不透明降级（无合成器的 X 桌面）──
+     此时窗口没有 alpha 通道，页面必须自己把底铺满、把球居中。
+     视觉从"圆球浮在桌面上"退化成"一条深色胶囊里嵌着球" —— 丑一点，但看得见。 */
+  body.opaque {
+    background: #1e1e22;
+    border-radius: 8px;
+    box-shadow: inset 0 0 0 1px rgba(255,255,255,.06);
+  }
+  body.opaque #dock { align-items: center; }
+  body.opaque.sink #dock { bottom: 0; } /* 不透明时不下沉，否则会被裁掉一半 */
+  body.opaque #dock { padding: 0 4px; }
+
   .orb {
     width: var(--size); height: var(--size); border-radius: 50%;
     position: relative; flex: 0 0 auto;
@@ -179,6 +191,9 @@
     document.body.classList.toggle('dock-left', cfg.dock === 'bottom-left');
     document.body.classList.toggle('dock-right', cfg.dock === 'bottom-right');
     document.body.classList.toggle('sink', sinkPx > 0);
+    /* 不透明降级：主进程的窗口 background 是深色，页面也要给同色底，
+       否则透明 html 会让窗口露出背景色但边缘对不上，看起来像一块补丁。 */
+    document.body.classList.toggle('opaque', !!lastOpaque);
     root.setProperty('--dock-shift', (lastShift || 0) + 'px');
 
     dock.textContent = '';
@@ -383,11 +398,13 @@
 
   /* ── 来自主进程的状态 ── */
   var lastShift = 0; // 球列水平偏移（overlay 模式：cfg.offset + 拖动实时量）
+  var lastOpaque = false; // 无合成器降级：窗口不透明，页面要自己铺底色
   api.on(function (msg) {
     try {
       if (!msg || msg.type !== 'state') return;
       repos = msg.repos || [];
       cfg = Object.assign(cfg, msg.cfg || {});
+      if (typeof msg.opaque === 'boolean') lastOpaque = msg.opaque;
       if (typeof msg.shift === 'number') {
         var moved = msg.shift !== lastShift;
         lastShift = msg.shift;

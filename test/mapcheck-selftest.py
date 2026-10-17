@@ -140,6 +140,29 @@ if shutil.which("xprop"):
 else:
     ok("（跳过）无 xprop", True)
 
+# ── L6 环境前提（合成器）：这决定 transparent 窗口能不能 map ──────────────
+# ⚠ 这是"球画出来了却看不见"的真正根因。校验输出必须自带这个前提，
+#   否则下次又只能从 NOT_MAPPED 猜"到底为什么没映射"。
+r6 = parse(run(args=["999999"]))
+env = (r6 or {}).get("env")
+ok("输出携带 env 环境前提（合成器/窗口管理器）", isinstance(env, dict) and "compositor" in env,
+   env)
+ok("env.compositor 是布尔值（不能是未知字符串）",
+   isinstance((env or {}).get("compositor"), bool), (env or {}).get("compositor"))
+ok("输出携带 ownWindows/ownCount（区分「没创建」与「创建了没 map」）",
+   isinstance((r6 or {}).get("ownCount"), int) and isinstance((r6 or {}).get("ownWindows"), list),
+   {"ownCount": (r6 or {}).get("ownCount")})
+
+# 交叉验证：直接问 xprop，与脚本自报必须一致
+if shutil.which("xprop"):
+    cm = subprocess.run(["xprop", "-root", "_NET_WM_CM_S0"],
+                        capture_output=True, text=True, timeout=6).stdout
+    expect = ("=" in cm) and ("not found" not in cm)
+    ok("env.compositor 与 xprop 实测一致",
+       (env or {}).get("compositor") == expect, {"script": (env or {}).get("compositor"), "xprop": cm.strip()[:80]})
+else:
+    ok("（跳过）无 xprop", True)
+
 # ── 汇总 ────────────────────────────────────────────────────────────────
 npass = sum(1 for x in results if x["pass"])
 print("\n%d/%d passed" % (npass, len(results)))

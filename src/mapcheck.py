@@ -95,6 +95,79 @@ def xprop_value(name, wid=None):
     return None
 
 
+def xlib_detail():
+    """除"在不在 client list"之外，再单独扫一遍窗口树，给出**每个**自己的窗口的
+    详细状态。这一步是本轮排查的关键：
+
+      _NET_CLIENT_LIST 只收**已映射**的窗口，所以"不在里面"既可能是
+      "窗口没创建"，也可能是"创建了但 map 失败"。两者处置完全不同，
+      只看 NOT_MAPPED 永远分不清，就会一直在错的方向上改代码。
+
+    返回 {"clients": [...]|None, "mine": [{id,state,override,geom,attrs...}]}
+    """
+    try:
+        from Xlib import X, display
+    except Exception:
+        return None
+    try:
+        d = display.Display(os.environ.get("DISPLAY", ":0"))
+    except Exception:
+        return None
+    root = d.screen().root
+
+    def walk(w, dep=0, acc=None):
+        acc = acc if acc is not None else []
+        if dep > 5:
+            return acc
+        try:
+            children = w.query_tree().children
+        except Exception:
+            return acc
+        for c in children:
+            try:
+                pm = c.get_full_property(d.intern_atom("_NET_WM_PID"), X.AnyPropertyType)
+                pid = int(pm.value[0]) if pm and pm.value else None
+                g = c.get_geometry()
+                at = c.get_attributes()
+                acc.append({
+                    "id": hex(c.id),
+                    "pid": pid,
+                    "map_state": at.map_state,       # 0=未映射 1=IsUnmapped 2=IsViewable
+                    "override_redirect": bool(at.override_redirect),
+                    "depth": at.depth,
+                    "geom": [g.x, g.y, g.width, g.height],
+                })
+            except Exception:
+                pass
+            walk(c, dep + 1, acc)
+        return acc
+
+    return walk(root)
+
+
+def wm_env():
+    """把"为什么映射不上"的环境前提一并抓出来，避免下次又靠猜。
+
+    合成器（_NET_WM_CM_S0）是 transparent 窗口的前提：
+    根窗口没有合成器时，ARGB 窗口在 X 上无法正常 present，
+    表现就是 **窗口创建成功、map 失败、像素却已经渲染好**。
+    """
+    out = {}
+    try:
+        xt = shutil.which("xprop")
+        if not xt:
+            return out
+        r = subprocess.run([xt, "-root", "_NET_WM_CM_S0"], capture_output=True,
+                           text=True, timeout=5)
+        out["compositor"] = "not found" not in r.stdout and "=" in r.stdout
+        r2 = subprocess.run([xt, "-root", "_NET_SUPPORTING_WM_CHECK"], capture_output=True,
+                            text=True, timeout=5)
+        out["wm_present"] = "=" in r2.stdout or "#" in r2.stdout
+    except Exception:
+        pass
+    return out
+
+
 def list_clients_xprop():
     """用 xprop/xwininfo 枚举 _NET_CLIENT_LIST 并读 PID；不可用返回 None。"""
     xwininfo = shutil.which("xwininfo")
@@ -164,14 +237,24 @@ def main():
         if clients is None:
             continue
         mine = [(wid, g) for (wid, pid, g, st) in clients if pid == want and st == 2]
-        emit({
+        res = {
             "ok": True,
             "mapped": bool(mine),
             "count": len(mine),
             "windows": [list(g) for _w, g in mine][:3],
             "via": via,
             "scanned": len(clients),
-        })
+        }
+        # 详细树扫描：只走得到 xlib 时做一次，用来说明"未映射"到底是哪种
+        # —— 窗口根本没创建 / 创建了但 map_state != IsViewable。
+        if via == "xlib":
+            tree = xlib_detail()
+            if tree is not None:
+                own = [w for w in tree if w.get("pid") == want]
+                res["ownWindows"] = own[:6]
+                res["ownCount"] = len(own)
+                res["env"] = wm_env()
+        emit(res)
 
     emit({"ok": False, "error": "no-xlib-and-no-xprop"})
 

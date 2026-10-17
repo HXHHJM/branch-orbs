@@ -170,6 +170,11 @@ const state = {
   repaintTimer: null,
   hideMenus: [],
   tray: null,
+  /* ── 透明能力探测结果 ──
+     transparent:true 的窗口必须有合成器（_NET_WM_CM_S0）才会被 map；
+     没有合成器时窗口创建成功、像素也渲染了，但 map 失败 → 屏幕空白。
+     探测到没有合成器就降级成"不透明小窗"，用实心底色代替透明。 */
+  opaque: false,
 };
 
 function cfg() {
@@ -315,7 +320,10 @@ function anchors() {
        彻底不依赖任何 setBounds 定位。水平偏移（offset/拖动）改由页面内完成。
      副作用控制：点击穿透由页面 hover 事件驱动（球上才接收点击），
        空白区域始终 setIgnoreMouseEvents(true,{forward:true})，不挡下层应用。 */
-  const OVERLAY = process.platform === 'linux';
+  /* ⚠ overlay 依赖透明：整屏铺一层看不见的窗口。
+     不透明降级后 overlay 就不成立了 —— 不透明窗口铺满工作区会盖死整个桌面。
+     所以降级时必须切回"小窗口只占球带一条"的形态。 */
+  const OVERLAY = process.platform === 'linux' && !state.opaque;
   const shift = Math.round((c.offset || 0) + (state.dragShift || 0));
 
   // 球探出需要的额外高度由 LIFT 提供，但 dockH 之外还要留出 LIFT，
@@ -603,6 +611,42 @@ function hitAt(px, py) {
      对策：show 之后 1.2s 用 X 反查一次"我这个 PID 有没有 mapped 窗口"，
      没有就自动降级重试（关硬件加速 → 再不行就报错给扩展侧显示）。
      不这么做的话，用户只能看到"没有球"，日志全是绿的。 */
+/* ── 合成器探测：决定能不能用透明窗口 ──
+
+   ⚠ 这是"球一直不出现"的**真正根因**，前面几轮全在错的方向上修：
+     实测日志 page probe 显示球在 DOM 里、尺寸 30×30、opacity 1、有背景色，
+     像素体检也在球带扫到 183 个不透明像素 —— **球确实画出来了**。
+     但 X map 校验 NOT_MAPPED，扫了 41 个窗口没有我们。
+
+   X 侧实测：
+       _NET_SUPPORTING_WM_CHECK → 有（窗口管理器在）
+       _NET_WM_CM_S0            → **not found（没有合成器）**
+       根窗口 depth             → 24（32 位 ARGB visual 虽存在但无人选用）
+
+   transparent:true 的窗口要求合成器做 alpha 混合。没有合成器时，
+   ARGB 窗口在 X 上没有可用的 present 路径（伴随 x11_software_bitmap_presenter
+   报 XGetWindowAttributes failed），于是 map 失败 → 像素画在看不见的窗口里。
+
+   对策：先探测，没有合成器就直接用**不透明窗口** + 实心底色。
+   视觉上从"圆球浮在桌面上"退化成"一条小色块贴在底边"，
+   但它是**真的能看见的** —— 比一个完美的透明球但看不见强得多。 */
+function detectCompositor() {
+  if (process.platform !== 'linux') return true;
+  try {
+    const xt = require('child_process');
+    const out = xt.execFileSync('xprop', ['-root', '_NET_WM_CM_S0'], {
+      encoding: 'utf8', timeout: 3000, env: process.env,
+    });
+    const has = /=/.test(out) && !/not found/i.test(out);
+    log('合成器探测: _NET_WM_CM_S0 ' + (has ? '存在（可用透明窗口）' : '不存在（将降级为不透明窗口）'),
+      '[' + (out || '').trim().slice(0, 80) + ']');
+    return has;
+  } catch (e) {
+    log('合成器探测失败，按"无合成器"处理（宁可丑，也要看得见）:', e.message);
+    return false;
+  }
+}
+
 function verifyMapped() {
   if (process.platform !== 'linux' || !state.win || state.win.isDestroyed()) return;
   const pid = process.pid;
@@ -634,11 +678,23 @@ function verifyMapped() {
     }
     log('X map 校验:', r.mapped ? 'MAPPED' : 'NOT_MAPPED',
       'via', r.via, 'py', used, 'windows', JSON.stringify(r.windows), 'scanned', r.scanned);
+    if (r.ownWindows) log('X 窗口树自查: 属于本进程的窗口',
+      r.ownCount, JSON.stringify(r.ownWindows), 'env', JSON.stringify(r.env));
     if (!r.mapped) {
       /* 走到这里说明：Electron 侧全绿，但 X 的客户端列表里没有这个窗口。
-         不要再自动 reloadIgnoringCache —— 实测无效，还会让页面状态重来一遍，
-         把诊断信息冲掉。只上报，交给 boot.log 说话。 */
+         ⚠ 不要再 reloadIgnoringCache / 关 GPU —— 实测无效，
+         而且会把页面状态整个重来一遍，把诊断信息冲掉。
+
+         真正该做的是**换一种窗口**：compositor 不存在时透明窗口必然 map 失败，
+         唯一的出路是不透明窗口。这一步只做一次（state.opaque 守卫）。 */
       log('⚠ 窗口未映射到 X —— 屏幕上看不到球（Electron isVisible 会骗人）');
+      const env = r.env || {};
+      if (env.compositor === false && !state.opaque) {
+        log('→ 定位：_NET_WM_CM_S0 不存在，X 上没有合成器，'
+          + 'transparent:true 的窗口无法 present。改为不透明窗口重建。');
+        rebuildOpaque();
+        return;
+      }
       send({ type: 'diag', warn: 'window-not-mapped', via: r.via, scanned: r.scanned });
     }
   };
@@ -650,6 +706,34 @@ function verifyMapped() {
      所以最后再截一次图，统计球带区域的不透明像素：
        底部停靠时，窗口最后 dockH+lify 那一条里必须有非透明像素。 */
   setTimeout(probePixels, 1900);
+}
+
+/* ── 降级：不透明窗口重建 ──
+
+   为什么是"重建"而不是"改属性"：transparent 是 BrowserWindow 的
+   **构造期**选项，创建后无法切换。想让窗口变成不透明，只能销毁重建。
+
+   布局也要跟着改：不透明窗口不能铺满整个工作区（会盖死桌面），
+   所以降级时切回"小窗口"形态 —— 只占球带那一小条。 */
+function rebuildOpaque() {
+  if (state.opaque) return;
+  state.opaque = true;
+  log('→ 降级为不透明窗口（小窗形态，只占球带一条）');
+  try {
+    state.opaqueRebuilding = true;
+    if (state.win && !state.win.isDestroyed()) state.win.destroy();
+  } catch (e) {
+    log('销毁旧窗口失败:', e.message);
+  }
+  state.win = null;
+  setTimeout(() => {
+    try {
+      const w = createWindow();
+      if (w) log('不透明窗口已创建');
+    } catch (e) {
+      log('不透明窗口创建失败:', e.message);
+    }
+  }, 120);
 }
 
 /** 抓图统计球带区域的不透明像素，作为"用户真的看得见"的最终证据。 */
@@ -702,14 +786,18 @@ function probePixels() {
 
 function createWindow() {
   const a = anchors();
-  log('createWindow', JSON.stringify(a.win), 'wa', JSON.stringify(a.workArea), 'view', JSON.stringify(state.view));
+  log('createWindow', JSON.stringify(a.win), 'wa', JSON.stringify(a.workArea),
+    'view', JSON.stringify(state.view), 'opaque', state.opaque);
   const win = new BrowserWindow({
     x: a.win.x,
     y: a.win.y,
     width: a.win.width,
     height: a.win.height,
     frame: false,
-    transparent: true,
+    /* ⚠ 透明与否是**构造期**选项，创建后不能改。
+       没有合成器时 transparent:true 会导致窗口 map 失败（屏幕空白），
+       所以 detectCompositor() 的结论在这里生效。 */
+    transparent: !state.opaque,
     hasShadow: false,
     resizable: false,
     movable: false,
@@ -724,7 +812,9 @@ function createWindow() {
     acceptFirstMouse: true,
     show: false,
     useContentSize: true,
-    backgroundColor: '#00000000',
+    /* 不透明降级时给一个深色底：球是浅色的，贴在深底上比白底清楚得多，
+       也更接近"悬浮条"的观感（而不是一块白板）。 */
+    backgroundColor: state.opaque ? '#1e1e22' : '#00000000',
     type: 'toolbar',
     webPreferences: {
       // ⚠ preload 漏了 = 页面上没有 window.orbs，第一行 post('ready') 就抛
@@ -932,7 +1022,13 @@ function pushState() {
   // ⚠ 必须带 type:'state' —— 页面侧 api.on 的第一行就是 `if (msg.type !== 'state') return;`。
   //   漏了它，页面收到消息后静默返回，球永远不出现，而且不报任何错。
   //   shift：overlay 模式下球列的水平偏移（cfg.offset + 拖动实时量），页面据此平移 dock。
-  state.win.webContents.send('state', { type: 'state', repos: state.repos, cfg: c, shift: Math.round((c.offset || 0) + (state.dragShift || 0)) });
+  state.win.webContents.send('state', {
+    type: 'state',
+    repos: state.repos,
+    cfg: c,
+    shift: Math.round((c.offset || 0) + (state.dragShift || 0)),
+    opaque: !!state.opaque,
+  });
 }
 /* ───────────────────────── 页面事件 ───────────────────────── */
 
@@ -1220,6 +1316,11 @@ app.whenReady().then(() => {
   try {
     app.dock && app.dock.hide();
   } catch (_) {}
+  /* 建窗口**之前**先问清楚有没有合成器。
+     有 → 透明 overlay（球浮在桌面底边，理想形态）
+     没有 → 不透明小窗（球贴在一条深色条上，退化但真的看得见）
+     这个判断必须在 new BrowserWindow 之前，因为 transparent 是构造期选项。 */
+  if (!detectCompositor()) state.opaque = true;
   bootBall();
   // ⚠ stdin 可能根本不存在（Playwright/Cron/某些启动器里为 null 或立刻 EOF）。
   // 直接给 process.stdin 挂 'end' 会在启动瞬间 quit，表现是
