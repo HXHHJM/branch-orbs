@@ -14,6 +14,7 @@
 const { app, BrowserWindow, screen, ipcMain, Menu, Tray, nativeImage } = require('electron');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 const readline = require('readline');
 
 if (process.env.BRANCH_ORBS_USER_DATA) {
@@ -206,14 +207,15 @@ let anchorWin = null;
      只读一次并缓存（工作区只有在分辨率/顶栏变化时才会变）。
      读不到就退回 Electron 的 workArea —— 至少 Xorg 会话下是对的。 */
 let cachedWA = null;
+let waTried = false;
 function xWorkArea() {
   if (cachedWA) return cachedWA;
+  if (waTried) return null; // 试过一轮就够，别在每次 anchors() 里重复 spawn
+  waTried = true;
   if (process.platform !== 'linux') return null;
   const script = path.join(__dirname, '..', 'src', 'workarea.py');
   if (!fs.existsSync(script)) return null;
-  // 依次试几个解释器：扩展自带的、系统 python3
-  const pys = [process.env.BRANCH_ORBS_PY, 'python3', '/usr/bin/python3'].filter(Boolean);
-  for (const py of pys) {
+  for (const py of pythonCandidates()) {
     try {
       const out = require('child_process').execFileSync(py, [script], {
         encoding: 'utf8',
@@ -223,7 +225,7 @@ function xWorkArea() {
       const r = JSON.parse((out || '').trim().split('\n').pop() || '{}');
       if (r && r.ok) {
         cachedWA = { x: r.x, y: r.y, width: r.width, height: r.height };
-        log('workArea 来源 X _NET_WORKAREA:', JSON.stringify(cachedWA), 'desktop', r.desktop);
+        log('workArea 来源 X _NET_WORKAREA:', JSON.stringify(cachedWA), 'desktop', r.desktop, 'py', py);
         return cachedWA;
       }
       log('workArea 读不到（' + py + '）:', r && r.error);
@@ -231,7 +233,35 @@ function xWorkArea() {
       log('workArea 脚本失败（' + py + '）:', e.message);
     }
   }
+  log('workArea：所有解释器都拿不到 _NET_WORKAREA，退回 Electron workArea（Wayland 下会偏一个顶栏）');
   return null;
+}
+
+/* 候选解释器，按"更可能有 python-xlib"排序。
+   ⚠ 踩过的坑：首版只试 python3 / /usr/bin/python3，而系统 python3 没装 Xlib，
+     日志刷三行 "no-xlib: No module named 'Xlib'"，workArea 退回 Electron 的整屏值，
+     球又跑回屏幕中上部 —— 和没修一模一样。
+     xwin.py 早就依赖 python-xlib（点击球控窗在用），所以**它自己就是最好的探针**：
+     哪个解释器能 import Xlib，就用哪个。
+   顺序：
+     ① BRANCH_ORBS_PY 显式指定（用户兜底）
+     ② pi 安装的那套 venv（本机就是它，实测 Xlib 0.33 可用）
+     ③ python3 / python（PATH 里的，可能装了也可能没有）
+     ④ /usr/bin/python3（系统自带的，通常没有 Xlib，但别漏） */
+function pythonCandidates() {
+  const list = [];
+  const add = (p) => {
+    if (p && !list.includes(p)) list.push(p);
+  };
+  add(process.env.BRANCH_ORBS_PY);
+  // WorkBuddy 托管 venv：路径固定，且 xwin.py 也是用这套跑通的
+  add('/home/hy/.workbuddy/binaries/python/envs/default/bin/python');
+  // 用户家目录下的常见 venv 位置（换机器时兜底）
+  add(path.join(os.homedir(), '.branch-orbs', 'venv', 'bin', 'python3'));
+  add('python3');
+  add('python');
+  add('/usr/bin/python3');
+  return list;
 }
 
 function workAreaFor(rect) {

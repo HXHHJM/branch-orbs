@@ -72,8 +72,39 @@ if r.get("ok"):
     except Exception as e:
         print("INFO  跳过屏幕尺寸交叉校验:", e)
     ok("y 偏移非负（顶栏避让方向正确）", r["y"] >= 0, r["y"])
+    # via 字段必须自报家门：xlib / xprop。
+    # 这条断言是踩坑后加的 —— 首版只走 xlib，环境里没装就静默退回整屏值，
+    # 而日志只有一行 "no-xlib"，很容易被当成无害警告划过去。
+    ok("报告了读取方式 via", r.get("via") in ("xlib", "xprop"), r.get("via"))
 else:
     print("INFO  当前会话读不到 _NET_WORKAREA，跳过 L2（Xorg 下应该能读到）")
+
+# ── L2b: 强制走 xprop 路径（把 Xlib 屏蔽掉），结果必须与正常路径一致 ──
+# 这是关键回归：用户机器上系统 python3 没装 Xlib，只有 xprop 可用。
+# 不给这条路径单独断言的话，xprop 分支坏了也发现不了。
+block = (
+    "import sys, builtins\n"
+    "_real = builtins.__import__\n"
+    "def _imp(name, *a, **k):\n"
+    "    if name == 'Xlib' or name.startswith('Xlib.'):\n"
+    "        raise ImportError('blocked-for-test')\n"
+    "    return _real(name, *a, **k)\n"
+    "builtins.__import__ = _imp\n"
+    "exec(compile(open(sys.argv[1]).read(), sys.argv[1], 'exec'))\n"
+)
+p3 = subprocess.run([PY, "-c", block, SCRIPT], capture_output=True, text=True, timeout=10,
+                    env=dict(os.environ, DISPLAY=os.environ.get("DISPLAY", ":0")))
+try:
+    r3 = json.loads(p3.stdout.strip().splitlines()[-1])
+    ok("屏蔽 Xlib 后仍能读（xprop 兜底生效）", r3.get("ok") is True, r3)
+    if r.get("ok") and r3.get("ok"):
+        same = [r3["x"], r3["y"], r3["width"], r3["height"]] == [r["x"], r["y"], r["width"], r["height"]]
+        ok("xprop 路径与 xlib 路径结果一致", same,
+           {"xlib": [r["x"], r["y"], r["width"], r["height"]],
+            "xprop": [r3["x"], r3["y"], r3["width"], r3["height"]]})
+        ok("xprop 路径自报 via=xprop", r3.get("via") == "xprop", r3.get("via"))
+except Exception as e:
+    ok("屏蔽 Xlib 后仍能读（xprop 兜底生效）", False, {"rc": p3.returncode, "err": p3.stderr[:200], "e": str(e)})
 
 # ── L3: 与 xprop 交叉验证 ──
 if shutil.which("xprop") and r.get("ok"):
