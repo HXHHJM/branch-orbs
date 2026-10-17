@@ -642,7 +642,60 @@ function verifyMapped() {
       send({ type: 'diag', warn: 'window-not-mapped', via: r.via, scanned: r.scanned });
     }
   };
-  setTimeout(probe, 1200);
+  setTimeout(probe, 1300);
+  /* 第二道体检：**像素级**。
+     前面所有证据（isVisible / did-finish-load / DOM 里有 .orb / X 里 MAPPED）
+     都只能证明"东西在那儿"，不能证明"球被画出来了"。
+     透明窗口里球完全可以是 0 宽、opacity:0、或被 CSS 推到视口外 —— 全都"正常"。
+     所以最后再截一次图，统计球带区域的不透明像素：
+       底部停靠时，窗口最后 dockH+lify 那一条里必须有非透明像素。 */
+  setTimeout(probePixels, 1900);
+}
+
+/** 抓图统计球带区域的不透明像素，作为"用户真的看得见"的最终证据。 */
+function probePixels() {
+  if (!state.win || state.win.isDestroyed()) return;
+  const a = anchors();
+  state.win.webContents
+    .capturePage()
+    .then((img) => {
+      const size = img.getSize();
+      const bmp = img.toBitmap(); // BGRA
+      if (!size.width || !size.height || bmp.length < size.width * size.height * 4) {
+        log('像素体检：截图尺寸异常', JSON.stringify(size));
+        return;
+      }
+      /* 球带在页面坐标里的纵向范围：底部停靠 → 视口最后 dockH 高的一条（含上探 lift）。
+         这里按 dockH + lift 取保守带宽，宁可多扫一点也不能漏。
+         ⚠ dockH / lift 在 anchors().metrics 里，不在 anchors() 顶层。 */
+      const met = a.metrics || {};
+      const bandH = Math.max(1, Math.round((met.dockH || 38) + (met.lift || 19)));
+      const bandTop = Math.max(0, size.height - bandH);
+      let opaque = 0;
+      let total = 0;
+      let sampled = 0;
+      for (let y = bandTop; y < size.height; y += 2) {
+        for (let x = 0; x < size.width; x += 2) {
+          const i = (y * size.width + x) * 4;
+          const al = bmp[i + 3];
+          total++;
+          if (al > 16) {
+            opaque++;
+            sampled = Math.max(sampled, 1);
+          }
+        }
+      }
+      const pct = total ? (opaque / total) : 0;
+      log('像素体检: 球带不透明像素 ' + opaque + '/' + total +
+        ' (' + (pct * 100).toFixed(2) + '%)  band=' + JSON.stringify({
+          top: bandTop, h: size.height - bandTop, dockH: Math.round(met.dockH || 0),
+        }) + ' view=' + JSON.stringify({ w: size.width, h: size.height }));
+      if (opaque === 0) {
+        log('⚠ 球带区域一个不透明像素都没有 —— 球确实没画出来（不是"位置不对"）');
+        send({ type: 'diag', warn: 'orbs-invisible-pixels' });
+      }
+    })
+    .catch((e) => log('像素体检失败(可忽略): ' + e.message));
 }
 
 /* ───────────────────────── 窗口 ───────────────────────── */
@@ -741,6 +794,16 @@ function createWindow() {
   }
   ipcMain.on('__orbs', (_e, channel, payload) => deliver(channel, payload));
   for (const ch of PAGE_CHANNELS) ipcMain.on(ch, (_e, payload) => deliver(ch, payload));
+  /* preload 把页面侧异常转发到这里。⚠ console-message 那条路在某些 Electron
+     版本/合成路径下收不到页面 console.error，所以异常必须单独走一条 IPC。 */
+  ipcMain.on('log', (_e, m) => {
+    if (!m || !m.text) return;
+    /* 环形缓冲，只做上限，不无限涨 */
+    state.pageLogs = state.pageLogs || [];
+    state.pageLogs.push(String(m.text).slice(0, 4000));
+    if (state.pageLogs.length > 200) state.pageLogs.splice(0, state.pageLogs.length - 200);
+    log('PAGE-' + (m.level || 'log') + ': ' + m.text);
+  });
   win.webContents.on('ipc-message', (_e, channel, args) => deliver(channel, (args && args[0]) || {}));
   win.webContents.on('console-message', (e, level, msg) => {
     log('page:', msg);
@@ -767,9 +830,27 @@ function createWindow() {
      这三行日志是"球不出现"时唯一能定位问题的证据，不要删。 */
   win.webContents.on('did-finish-load', () => {
     log('did-finish-load url=' + win.webContents.getURL());
+    /* ⚠ 探针选择器写错了一次：球的实际 class 是 .orb，探针查的是 .ball，
+       于是日志永远打印 balls:0 —— 看起来像"DOM 里没球"，
+       实际球可能一直都在。假阴性比没有日志更坏，它会把排查带偏。
+       现在同时取 .orb 数量和第一个球的实测几何/透明度，
+       只有"有球 + 尺寸 > 0 + opacity > 0 + 在窗口内"才算真的看得见。 */
     win.webContents
       .executeJavaScript(
-        '({orbs: typeof window.orbs, hasDock: !!document.getElementById("dock"), balls: document.querySelectorAll(".ball").length})',
+        [
+          '(function(){',
+          '  var d=document.getElementById("dock");',
+          '  var bs=document.querySelectorAll(".orb");',
+          '  var out={orbs:typeof window.orbs,hasDock:!!d,orbsDom:bs.length};',
+          '  if(d){var dr=d.getBoundingClientRect();',
+          '    out.dockRect=[Math.round(dr.left),Math.round(dr.top),Math.round(dr.width),Math.round(dr.height)];}',
+          '  if(bs.length){var r=bs[0].getBoundingClientRect();var cs=getComputedStyle(bs[0]);',
+          '    out.first=[Math.round(r.left),Math.round(r.top),Math.round(r.width),Math.round(r.height)];',
+          '    out.opacity=cs.opacity;out.visibility=cs.visibility;out.display=cs.display;',
+          '    out.bg=cs.backgroundColor;}',
+          '  out.vw=innerWidth;out.vh=innerHeight;',
+          '  return out;})()',
+        ].join('\n'),
         true
       )
       .then((r) => log('page probe: ' + JSON.stringify(r)))
