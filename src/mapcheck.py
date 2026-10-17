@@ -13,9 +13,12 @@
        而系统 python3 没装 Xlib，校验脚本自己就崩了，
        日志只有一句 "X map 校验失败(可忽略)"，等于白做。
 
-用法：python3 mapcheck.py <pid>
+用法：python3 mapcheck.py <pid> [x y w h]
+     后四个可选：期望窗口几何。XWayland 下 Chromium 顶层窗口可能不带
+     _NET_WM_PID，此时用几何吻合的 IsViewable 窗口认领（mappedBy=geometry）。
+
 输出（stdout 一行 JSON）：
-  {"ok":true,"mapped":true,"windows":[[x,y,w,h]],"via":"xlib"}
+  {"ok":true,"mapped":true,"windows":[[x,y,w,h]],"via":"xlib","mappedBy":"pid"}
   {"ok":true,"mapped":false,"windows":[],"via":"xprop"}
   {"ok":false,"error":"..."}   ← 两条路径都不可用
 """
@@ -303,6 +306,42 @@ def main():
                 res["ownCount"] = len(own)
                 res["ownViewable"] = sum(1 for w in own if w.get("map_state") == 2)
                 res["env"] = wm_env()
+                # ── override_redirect 的窗口不进 _NET_CLIENT_LIST ──
+                # ⚠ 这是最容易误判的一类，实测过：
+                #   用 python-xlib 建一个 override_redirect=1 的窗口，map() 之后
+                #   map_state==2（屏幕上确实有），但 _NET_CLIENT_LIST 里查不到它。
+                #   如果 Electron 的窗口是这种方式上屏的，按"在不在 client list"
+                #   判断就会永远说 NOT_MAPPED —— 假阴性，会把人往错方向带。
+                #   这里把所有 IsViewable 的窗口都报出来，让日志能看出真实情况。
+                all_viewable = [
+                    {"id": w["id"], "geom": w["geom"], "pid": w["pid"],
+                     "or": w["override_redirect"]}
+                    for w in tree if w.get("map_state") == 2
+                ]
+                res["allViewable"] = all_viewable[:10]
+                res["allViewableCount"] = len(all_viewable)
+                # ── 几何兜底 ──
+                # ⚠ 实测发现：XWayland 下 Chromium 的顶层窗口可能**不带 _NET_WM_PID**
+                #   （xprop 全 None：WM_CLASS/WM_NAME/TYPE 都没有），
+                #   于是按 PID 找永远 NOT_MAPPED —— 但这个窗口可能已经在屏幕上了。
+                #   调用方把期望几何传进来（argv[2..5] = x y w h），
+                #   几何完全吻合的 IsViewable 窗口也算"我们的"。
+                if (not res["mapped"] or res["ownCount"] == 0) and len(sys.argv) >= 6:
+                    try:
+                        ex, ey, ew, eh = (int(v) for v in sys.argv[2:6])
+                        cand = [
+                            w for w in tree
+                            if w.get("map_state") == 2
+                            and w.get("pid") is None          # 无主窗口才用几何认领
+                            and w["geom"][2] == ew and w["geom"][3] == eh
+                        ]
+                        if cand:
+                            res["geoMatch"] = [w["geom"] for w in cand]
+                            res["mapped"] = True
+                            res["mappedBy"] = "geometry"
+                            res["windows"] = [w["geom"] for w in cand][:3]
+                    except (ValueError, IndexError):
+                        pass
         emit(res)
 
     emit({"ok": False, "error": "no-xlib-and-no-xprop"})

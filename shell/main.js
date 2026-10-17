@@ -661,7 +661,18 @@ function verifyMapped() {
     let used = null;
     for (const py of pythonCandidates()) {
       try {
-        const out = require('child_process').execFileSync(py, [script, String(pid)], {
+        /* 后四个参数是期望几何：XWayland 下 Chromium 顶层窗口可能不带
+           _NET_WM_PID（xprop 全 None），按 PID 找会永远 NOT_MAPPED，
+           但窗口其实在屏幕上。传几何让它用尺寸认领。 */
+        const want = (() => {
+          try {
+            const b = state.win.getBounds();
+            return [b.width, b.height];
+          } catch (_) { return null; }
+        })();
+        const args = [script, String(pid)];
+        if (want) args.push('0', '0', String(want[0]), String(want[1]));
+        const out = require('child_process').execFileSync(py, args, {
           encoding: 'utf8', timeout: 5000, env: process.env,
         });
         r = JSON.parse((out || '').trim().split('\n').pop() || '{}');
@@ -677,20 +688,38 @@ function verifyMapped() {
       return;
     }
     log('X map 校验:', r.mapped ? 'MAPPED' : 'NOT_MAPPED',
-      'via', r.via, 'py', used, 'windows', JSON.stringify(r.windows), 'scanned', r.scanned);
+      'via', r.via, 'py', used, 'windows', JSON.stringify(r.windows), 'scanned', r.scanned,
+      r.mappedBy ? ('mappedBy=' + r.mappedBy) : '');
     if (r.ownWindows) log('X 窗口树自查: 属于本进程的窗口',
       r.ownCount, JSON.stringify(r.ownWindows), 'env', JSON.stringify(r.env));
+    /* 屏幕上（IsViewable）到底有哪些窗口、在什么位置。
+       ⚠ 这一行是为了抓一类假阴性：override_redirect 的窗口不进 _NET_CLIENT_LIST，
+         所以"列表里没有"≠"屏幕上看不到"。如果我们的球带几何出现在这里，
+         说明窗口其实在屏幕上，只是被 client list 漏报了。 */
+    if (r.allViewable) log('X 屏幕上的窗口(' + r.allViewableCount + '):',
+      JSON.stringify(r.allViewable));
 
     /* ⚠ _NET_CLIENT_LIST 不是唯一证据，这点很关键：
-       在 GNOME Shell + XWayland 下，mutter 只把 **NORMAL 类型**的窗口写进
-       _NET_CLIENT_LIST；type:'toolbar' 的窗口能创建、能渲染、像素都在，
-       但永远不会进列表 → 一直报 NOT_MAPPED，而它可能其实就在屏幕上。
+       实测两类窗口"在屏幕上但不在列表里"：
+         ① mutter 对非 NORMAL 类型（toolbar 等）不登记
+         ② override_redirect=1 的窗口**从来不进** client list
+            （我用 python-xlib 建过：map_state=2，屏幕上真在，列表里没有）
 
-       所以再查一层：窗口树里属于本 PID、且 map_state==2(IsViewable) 的窗口
-       也算"可见"。两个证据任一成立都算 OK；都失败才真的报错。 */
+       所以证据按强弱排三级，任一成立就算"已在屏幕上"：
+         1) PID 命中且 IsViewable
+         2) 几何完全吻合的 IsViewable 无主窗口
+         3) 上面都没有，才算真的没映射 */
+    const b = (() => { try { return state.win.getBounds(); } catch (_) { return null; } })();
+    const geoHit = !!b && (r.allViewable || []).some(
+      (w) => w && w.geom && w.geom[2] === b.width && w.geom[3] === b.height);
+    if (!r.mapped && geoHit) {
+      log('→ client list 没收录，但屏幕上有同尺寸窗口（' + b.width + '×' + b.height +
+        '）—— 已可见，属正常漏报');
+      return;
+    }
     const treeVisible = (r.ownWindows || []).some((w) => w && w.map_state === 2);
     if (!r.mapped && treeVisible) {
-      log('→ _NET_CLIENT_LIST 没收录，但窗口树里 IsViewable —— 已可见（mutter 对非 NORMAL 类型不登记）');
+      log('→ client list 没收录，但窗口树里 IsViewable —— 已可见');
       return;
     }
     if (!r.mapped) {
@@ -698,6 +727,8 @@ function verifyMapped() {
          ⚠ 不要再 reloadIgnoringCache / 关 GPU —— 实测无效，
          而且会把页面状态整个重来一遍，把诊断信息冲掉。 */
       log('⚠ 窗口未映射到 X —— 屏幕上看不到球（Electron isVisible 会骗人）');
+      log('   屏幕上的窗口共 ' + (r.allViewableCount || 0) + ' 个，期望尺寸 ' +
+        (b ? b.width + '×' + b.height : '?') + '；以上面那行 "X 屏幕上的窗口" 为准');
       send({ type: 'diag', warn: 'window-not-mapped', via: r.via, scanned: r.scanned });
     }
   };

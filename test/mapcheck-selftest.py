@@ -174,6 +174,24 @@ if target_pid:
 else:
     ok("（跳过）无已 map 窗口可测树扫描", True)
 
+# ── L8 allViewable：屏幕上的窗口清单（含 override_redirect） ──────────────
+# ⚠ 这是抓"假阴性"的关键数据源：override_redirect 的窗口 map 之后
+#   在屏幕上但**不进 _NET_CLIENT_LIST**，只查 client list 会误报 NOT_MAPPED。
+rt2 = parse(run(args=["999999"]))
+av = (rt2 or {}).get("allViewable")
+ok("输出携带 allViewable（屏幕上的窗口清单）", isinstance(av, list), type(av).__name__)
+ok("allViewable 每项带 geom 与 or 标记",
+   bool(av) and all(isinstance(w.get("geom"), list) and len(w["geom"]) == 4
+                    and isinstance(w.get("or"), bool) for w in av),
+   (av or [])[:2])
+ok("allViewableCount 与 allViewable 长度自洽（未截断时相等）",
+   (rt2 or {}).get("allViewableCount", 0) == len(av or [])
+   or (rt2 or {}).get("allViewableCount", 0) > 10,
+   {"count": (rt2 or {}).get("allViewableCount"), "len": len(av or [])})
+ok("allViewable 里确实能出现 or=true 的窗口（证明扫的是全树不是 client list）",
+   any(w.get("or") is True for w in (av or [])),
+   [w for w in (av or []) if w.get("or") is True][:2])
+
 # 交叉验证：直接问 xprop，与脚本自报必须一致
 if shutil.which("xprop"):
     cm = subprocess.run(["xprop", "-root", "_NET_WM_CM_S0"],
