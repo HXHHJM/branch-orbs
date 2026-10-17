@@ -93,12 +93,46 @@ PY
     RC=1
   fi
 
-  # 4) extensions.json 里必须登记了这个扩展，否则 VSCode 根本不扫描这个目录
+  # 4) extensions.json 里必须登记了这个扩展，否则 VSCode 根本不扫描这个目录。
+  #    ⚠ CLI 的 --install-extension 自己解压时可能留下半成品 <id>.tmp 目录，
+  #      并把 relativeLocation 写成 *.tmp —— 之后 VSCode 按登记去读
+  #      <id>.tmp/package.json 就报 "Unable to resolve nonexistent file"。
+  #      必须把登记纠正回真实目录，并清掉 CLI 留下的 tmp 残留。
   EJ="$UD/extensions/extensions.json"
-  if [ -f "$EJ" ] && grep -q 'heyuying.branch-orbs' "$EJ"; then
-    echo "  ✅ extensions.json 已登记"
+  /home/hy/.workbuddy/binaries/python/envs/default/bin/python - "$UD" <<'PY'
+import sys, os, json, shutil
+ud = sys.argv[1]
+extdir = os.path.join(ud, 'extensions')
+ej = os.path.join(extdir, 'extensions.json')
+if not os.path.exists(ej):
+    print('  ❌ extensions.json 不存在')
+    sys.exit(1)
+entries = json.load(open(ej))
+changed = False
+for e in entries:
+    loc = e.get('relativeLocation', '')
+    if loc.endswith('.tmp'):
+        fixed = loc[:-4]
+        if os.path.isdir(os.path.join(extdir, fixed)):
+            e['relativeLocation'] = fixed
+            e['location']['path'] = os.path.join(extdir, fixed)
+            e['location']['fsPath'] = e['location']['path']
+            e['location']['external'] = 'file://' + e['location']['path']
+            changed = True
+            print('  🔧 已纠正登记：' + loc + ' → ' + fixed)
+# CLI 可能还留着半成品 tmp 目录，清掉（里面没有完整 package.json，留着必报错）
+for n in os.listdir(extdir):
+    if n.startswith('heyuying.branch-orbs') and n.endswith('.tmp'):
+        shutil.rmtree(os.path.join(extdir, n), ignore_errors=True)
+        print('  🧹 已清理残留：' + n)
+if changed:
+    json.dump(entries, open(ej, 'w'))
+PY
+
+  if [ -f "$EJ" ] && grep -q 'heyuying.branch-orbs' "$EJ" && ! grep -q '\.tmp' "$EJ"; then
+    echo "  ✅ extensions.json 已登记且指向真实目录"
   else
-    echo "  ❌ extensions.json 未登记（VSCode 不会加载它）"
+    echo "  ❌ extensions.json 缺失/未登记/仍指向 .tmp"
     RC=1
   fi
 done
