@@ -1155,6 +1155,12 @@ function activate(context) {
         lines.push('     → 设置环境变量 BRANCH_ORBS_ELECTRON 指向 electron 可执行文件');
       }
       lines.push(OK(diagnostic.shellAlive()) + ' 壳进程：' + (diagnostic.shellAlive() ? '运行中' : '未运行'));
+      /* enabled=false 时壳本来就不该在跑 —— 别让用户对着"未运行"发懵。 */
+      const enabledCfg = vscode.workspace.getConfiguration('branchOrbs').get('enabled', true);
+      if (!enabledCfg) {
+        lines.push('     ⚠ 扩展当前处于关闭状态（branchOrbs.enabled=false）。');
+        lines.push('       点击状态栏的 Branch Orbs 豆子图标可重新开启，或执行「Branch Orbs: show」。');
+      }
       const sd = await diagnostic.request({ type: 'diag' }, 2000);
       if (sd && sd.data) {
         lines.push('     窗口 bounds：' + JSON.stringify(sd.data.bounds));

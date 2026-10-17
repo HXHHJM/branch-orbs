@@ -1345,7 +1345,7 @@ function bandColoredViaX() {
       'g=w.get_geometry()',
       'bh,bw=int(sys.argv[2]),int(sys.argv[3])',
       'img=w.get_image(0,max(0,g.height-bh),min(bw,g.width),min(bh,g.height),X.ZPixmap,0xffffffff)',
-      'dd=img.data; n=max(1,g.width)',
+      'dd=img.data; n=max(1,min(int(sys.argv[3]),g.width))',
       'c=0',
       'for y in range(min(bh,g.height)):',
       '    row=dd[y*n*4:(y+1)*n*4]',
