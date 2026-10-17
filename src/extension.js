@@ -312,7 +312,7 @@ function activate(context) {
   /** 一颗豆子的 tooltip：这个仓库的全部信息 */
   function repoLines(r, idx, total) {
     const lines = [
-      'Branch Orbs（点击显示/隐藏悬浮球）',
+      'Branch Orbs 豆子（点击显示/隐藏悬浮球）',
       '仓库：' + r.name + '  (' + r.root + ')',
       '分支：' + r.branch + (r.isActive ? '  ← 当前文件' : ''),
     ];
@@ -372,7 +372,12 @@ function activate(context) {
         const r = shown[i];
         // 有改动就在分支名后加 ●，一眼能看出哪个工程是脏的
         const dirty = (r.changed || 0) > 0 ? ' ●' : '';
-        const icon = r.error ? '$(warning)' : '$(circle-large-filled)';
+        /* 图标区分：活动=实心●，非活动=空心○，出错=⚠。
+           ⚠ 踩过的坑：VSCode 内置 Git 的 SCM 状态项显示的是"⑂ 分支名"，
+             文字和我们一模一样 —— 用户 hover 到它弹的是"Checkout Branch/Tag"，
+             然后误以为我们的 tooltip 坏了（实测真发生过）。
+             所以图标必须和 Git 的 ⑂ 拉开差距，让人不会认错豆子。 */
+        const icon = r.error ? '$(warning)' : r.isActive ? '$(circle-large-filled)' : '$(circle-large-outline)';
         const text = icon + ' ' + r.branch + dirty;
         makeDot(
           text,
