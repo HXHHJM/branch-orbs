@@ -2068,6 +2068,101 @@ function onLine(line) {
   }
 }
 
+/* ───────────────────────── 呈现实验室 ─────────────────────────
+   宿主上 Electron 窗口拿不到帧（X GetImage 全空），但同屏 VSCode（同为
+   Chromium）呈现正常。用本壳进程做实验台：以不同开关组合拉起红块测试
+   子窗口，再用 python-xlib GetImage 逐个验证哪个组合能真正落帧。
+   每个 userData 只跑一次（marker 防重跑）。 */
+function runPresentLab() {
+  try {
+    if (process.platform !== 'linux') return;
+    const fs = require('fs');
+    const path = require('path');
+    const marker = path.join(app.getPath('userData'), 'present-lab.done');
+    if (fs.existsSync(marker)) return;
+    fs.writeFileSync(marker, String(Date.now()));
+    const cp = require('child_process');
+    const childJs = path.join(app.getPath('userData'), 'present-lab-child.js');
+    fs.writeFileSync(childJs, [
+      'const { app, BrowserWindow } = require("electron");',
+      'const idx = (process.argv.find(a => a.startsWith("--lab-idx=")) || "--lab-idx=0").slice(10);',
+      'app.whenReady().then(() => {',
+      '  const w = new BrowserWindow({ x: 250 + Number(idx) * 40, y: 250, width: 300, height: 200,',
+      '    frame: false, show: true, backgroundColor: "#000000", title: "bo-lab" + idx });',
+      '  w.loadURL("data:text/html,<body style=\'margin:0;background:#000\'><div style=\'margin:40px;width:120px;height:80px;background:#f00\'></div></body>");',
+      '});',
+    ].join('\n'));
+    const variants = [
+      { name: 'A-default', flags: ['--no-sandbox', '--disable-dev-shm-usage'] },
+      { name: 'B-x11', flags: ['--no-sandbox', '--ozone-platform=x11', '--disable-dev-shm-usage'] },
+      { name: 'C-x11-nogpu', flags: ['--no-sandbox', '--ozone-platform=x11', '--disable-gpu', '--disable-dev-shm-usage'] },
+      { name: 'D-wayland', flags: ['--no-sandbox', '--ozone-platform=wayland', '--disable-dev-shm-usage'] },
+    ];
+    const procs = [];
+    variants.forEach((v, i) => {
+      try {
+        const labEnv = Object.assign({}, process.env, { DISPLAY: process.env.DISPLAY || ':0' });
+        const p = cp.spawn(process.execPath, v.flags.concat(['--lab-idx=' + i, childJs]),
+          { detached: true, stdio: 'ignore', env: labEnv });
+        p.on('exit', (code, sig) => log('LAB 子窗退出', v.name, 'code', code, sig));
+        p.on('error', (e) => log('LAB 子窗错误', v.name, e.message));
+        p.unref();
+        procs.push(p);
+      } catch (e) { log('LAB spawn失败', v.name, e.message); }
+    });
+    log('LAB: 已拉起 4 个测试窗，10s 后读帧…');
+    setTimeout(() => {
+      const pys = (typeof pythonCandidates === 'function' && pythonCandidates()) || [];
+      const readScript = [
+        'from Xlib import display, X',
+        'd = display.Display(":0")',
+        'found = []',
+        'def walk(w):',
+        '    for c in w.query_tree().children:',
+        '        try:',
+        '            a = c.get_attributes()',
+        '            g = c.get_geometry()',
+        '        except Exception:',
+        '            continue',
+        '        if a.map_state == 2 and 280 < g.width < 440 and 180 < g.height < 300:',
+        '            found.append((g.x, g.y, g.width, g.height, c))',
+        '        walk(c)',
+        'walk(d.screen().root)',
+        'seen = set()',
+        'for x, y, w_, h_, c in found:',
+        '    key = (x, y, w_, h_)',
+        '    if key in seen:',
+        '        continue',
+        '    seen.add(key)',
+        '    idx = max(0, min(3, round((x - 250) / 40)))',
+        '    try:',
+        '        img = c.get_image(0, 0, w_, h_, X.ZPixmap, 0xffffffff)',
+        '        dd = img.data',
+        '        reds = 0',
+        '        for i in range(len(dd)//4):',
+        '            b, gr, r = dd[i*4], dd[i*4+1], dd[i*4+2]',
+        '            if (r > 200 and gr < 60 and b < 60) or (b > 200 and gr < 60 and r < 60): reds += 1',
+        '        print("idx", idx, "pos", x, y, "reds=", reds, "size=", w_, "x", h_)',
+        '    except Exception as e:',
+        '        print("idx", idx, "pos", x, y, "READFAIL", type(e).__name__)',
+      ].join('\n');
+      let done = false;
+      for (const py of pys.concat(['python3'])) {
+        try {
+          const out = cp.execFileSync(py, ['-c', readScript], { encoding: 'utf8', timeout: 10000, env: process.env });
+          log('LAB 结果:\n' + out.trim());
+          done = true;
+          break;
+        } catch (_) { /* try next */ }
+      }
+      if (!done) log('LAB: 读帧失败（无可用 python-xlib）');
+      procs.forEach((p) => { try { p.kill('SIGKILL'); } catch (_) {} });
+    }, 14000);
+  } catch (e) {
+    log('LAB 异常:', e.message);
+  }
+}
+
 function bootBall() {
   if (state.win && !state.win.isDestroyed()) {
     state.win.showInactive();
@@ -2089,6 +2184,7 @@ app.whenReady().then(() => {
      这个判断必须在 new BrowserWindow 之前，因为 transparent 是构造期选项。 */
   if (!detectCompositor()) state.opaque = true;
   bootBall();
+  runPresentLab();
   // ⚠ stdin 可能根本不存在（Playwright/Cron/某些启动器里为 null 或立刻 EOF）。
   // 直接给 process.stdin 挂 'end' 会在启动瞬间 quit，表现是
   // "Target page, context or browser has been closed" —— 而手动跑一切正常。
