@@ -182,6 +182,29 @@ def test_x():
         ok("toggle 第一次真的改变了窗口状态", (t1 or {}).get("changed") == 1, {"to": to1, "settled": d1[0].get("settled")})
         ok("toggle 第二次能切回来（往返闭环）", (t2 or {}).get("changed") == 1 and to1 != to2, {"to1": to1, "to2": to2})
         ok("两次都等到 WM 确认状态稳定（settled）", d1[0].get("settled") is True and d2[0].get("settled") is True)
+
+        # ── 连续多次 toggle 必须严格交替 ──
+        # 这是"点一次有效、点两次失效"那个竞态的直接回归测试：
+        # _NET_WM_STATE_HIDDEN 是 WM 异步更新的，若动作后不等状态落定，
+        # 第二次读到的还是旧值 → 又发一次同方向动作 → 看起来"点了没反应"。
+        seq = [to2]
+        for _ in range(3):
+            t, _, _ = run("toggle", "--all-classes", "branch-orbs")
+            det = (t or {}).get("detail") or [{}]
+            seq.append(det[0].get("to"))
+            if (t or {}).get("changed") != 1:
+                break
+        alternates = all(seq[i] != seq[i + 1] for i in range(len(seq) - 1))
+        ok(
+            "连续 toggle 严格交替 hidden/visible（竞态回归）",
+            alternates and len(seq) >= 4,
+            {"seq": seq},
+        )
+        # 收拾干净：确保停在 visible，别把用户窗口留成最小化
+        run("activate", "--all-classes", "branch-orbs")
+        out_fixed, _, _ = run("probe", "--all-classes", "branch-orbs")
+        fixed_hidden = ((out_fixed or {}).get("hits") or [{}])[0].get("hidden")
+        ok("自检结束时把窗口恢复成可见（不会把用户窗口留在最小化）", fixed_hidden is False, {"hidden": fixed_hidden})
     else:
         info("本机没有 branch-orbs 壳窗口，跳过 L3 真往返验证（不算失败）", {})
 
