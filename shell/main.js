@@ -607,41 +607,39 @@ function verifyMapped() {
   if (process.platform !== 'linux' || !state.win || state.win.isDestroyed()) return;
   const pid = process.pid;
   const probe = () => {
-    try {
-      const py = [
-        'import sys, os',
-        'from Xlib import X, display',
-        'd = display.Display(os.environ.get("DISPLAY", ":0"))',
-        'r = d.screen().root',
-        'def walk(w, dep=0):',
-        '    if dep > 4: return []',
-        '    out = []',
-        '    for c in w.query_tree().children:',
-        '        try:',
-        '            pm = c.get_full_property(d.intern_atom("_NET_WM_PID"), X.AnyPropertyType)',
-        '            if pm and pm.value[0] == int(sys.argv[1]) and c.get_attributes().map_state == 2:',
-        '                g = c.get_geometry()',
-        '                out.append([g.x, g.y, g.width, g.height])',
-        '            out += walk(c, dep + 1)',
-        '        except Exception: pass',
-        '    return out',
-        'f = walk(r)',
-        'print("MAPPED" if f else "NOT_MAPPED", f[:1])',
-      ].join('\n');
-      const out = require('child_process')
-        .execFileSync('python3', ['-c', py, String(pid)], { encoding: 'utf8', timeout: 4000 })
-        .trim();
-      log('X map 校验: ' + out);
-      if (out.startsWith('NOT_MAPPED')) {
-        log('⚠ 窗口未映射到 X —— 屏幕上看不到球，尝试软件合成降级');
-        try {
-          app.commandLine.appendSwitch('disable-gpu-compositing');
-          state.win.webContents.reloadIgnoringCache();
-        } catch (_) {}
-        send({ type: 'diag', warn: 'window-not-mapped' });
+    /* ⚠ 踩过的坑：首版把 Python 源码内联成 `python3 -c "..."`，
+       而系统 python3 没装 python-xlib → 校验脚本自己先崩，
+       日志只剩一句 "X map 校验失败(可忽略)"，等于校验白做。
+       现在改为外部脚本 src/mapcheck.py（xlib → xprop 双路径）+ 解释器探测。 */
+    const script = path.join(__dirname, '..', 'src', 'mapcheck.py');
+    if (!fs.existsSync(script)) { log('X map 校验跳过：缺少 mapcheck.py'); return; }
+    let r = null;
+    let used = null;
+    for (const py of pythonCandidates()) {
+      try {
+        const out = require('child_process').execFileSync(py, [script, String(pid)], {
+          encoding: 'utf8', timeout: 5000, env: process.env,
+        });
+        r = JSON.parse((out || '').trim().split('\n').pop() || '{}');
+        used = py;
+        if (r && r.ok) break;
+        log('X map 校验拿不到结果（' + py + '）:', r && r.error);
+      } catch (e) {
+        log('X map 校验脚本失败（' + py + '）:', e.message);
       }
-    } catch (e) {
-      log('X map 校验失败(可忽略): ' + e.message);
+    }
+    if (!r || !r.ok) {
+      log('X map 校验：所有解释器都失败，本项跳过（不影响显示）:', r && r.error);
+      return;
+    }
+    log('X map 校验:', r.mapped ? 'MAPPED' : 'NOT_MAPPED',
+      'via', r.via, 'py', used, 'windows', JSON.stringify(r.windows), 'scanned', r.scanned);
+    if (!r.mapped) {
+      /* 走到这里说明：Electron 侧全绿，但 X 的客户端列表里没有这个窗口。
+         不要再自动 reloadIgnoringCache —— 实测无效，还会让页面状态重来一遍，
+         把诊断信息冲掉。只上报，交给 boot.log 说话。 */
+      log('⚠ 窗口未映射到 X —— 屏幕上看不到球（Electron isVisible 会骗人）');
+      send({ type: 'diag', warn: 'window-not-mapped', via: r.via, scanned: r.scanned });
     }
   };
   setTimeout(probe, 1200);

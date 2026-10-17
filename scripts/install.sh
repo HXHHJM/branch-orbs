@@ -35,8 +35,9 @@ PY
 }
 WANT_XWIN=$(sizes 'src/xwin.py')
 WANT_WA=$(sizes 'src/workarea.py')
+WANT_MC=$(sizes 'src/mapcheck.py')
 WANT_MAIN=$(sizes 'shell/main.js')
-echo "包内指纹：xwin.py=$WANT_XWIN  workarea.py=$WANT_WA  main.js=$WANT_MAIN"
+echo "包内指纹：xwin.py=$WANT_XWIN  workarea.py=$WANT_WA  mapcheck.py=$WANT_MC  main.js=$WANT_MAIN"
 
 # 两个 profile：命令行 code 默认用 ~/.vscode，桌面图标默认用 ~/.config/Code
 PROFILES=("$HOME/.vscode" "$HOME/.config/Code")
@@ -85,7 +86,7 @@ PY
   #    用多个文件做指纹，不只盯一个 —— 单文件校验挡不住"新旧版本恰好同大小"，
   #    也挡不住"只有新加的文件没装进去"（workarea.py 就是本轮新增的，
   #    漏掉它的症状是球跑回屏幕中上部，和没修一样）。
-  for SPEC in "xwin.py:$WANT_XWIN" "workarea.py:$WANT_WA" "shell/main.js:$WANT_MAIN"; do
+  for SPEC in "xwin.py:$WANT_XWIN" "workarea.py:$WANT_WA" "mapcheck.py:$WANT_MC" "shell/main.js:$WANT_MAIN"; do
     NAME="${SPEC%%:*}"
     WANT="${SPEC##*:}"
     F="$UD/extensions/heyuying.branch-orbs-0.1.0/src/$NAME"

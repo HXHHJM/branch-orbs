@@ -61,6 +61,12 @@ run_one "ownerpid（窗口所属主进程 pid 的父链遍历）" \
 run_one "workarea（EWMH 工作区：顶栏避让）" \
   "${CLEAN_ENV[@]}" "$PY" test/workarea-selftest.py
 
+# mapcheck 是"球不出现"的唯一可靠证据来源。它自己曾经因为写死 python3
+# （系统 python3 没装 Xlib）而崩掉，日志只剩"校验失败(可忽略)"，
+# 等于诊断链断开 —— 所以兜底路径必须有断言。
+run_one "mapcheck（窗口是否真的 map 到 X）" \
+  "${CLEAN_ENV[@]}" "$PY" test/mapcheck-selftest.py
+
 run_one "activate（激活/状态栏豆子）" \
   "${CLEAN_ENV[@]}" "$NODE" test/activate-selftest.js
 
