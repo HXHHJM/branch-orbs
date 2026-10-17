@@ -680,21 +680,24 @@ function verifyMapped() {
       'via', r.via, 'py', used, 'windows', JSON.stringify(r.windows), 'scanned', r.scanned);
     if (r.ownWindows) log('X 窗口树自查: 属于本进程的窗口',
       r.ownCount, JSON.stringify(r.ownWindows), 'env', JSON.stringify(r.env));
-    if (!r.mapped) {
-      /* 走到这里说明：Electron 侧全绿，但 X 的客户端列表里没有这个窗口。
-         ⚠ 不要再 reloadIgnoringCache / 关 GPU —— 实测无效，
-         而且会把页面状态整个重来一遍，把诊断信息冲掉。
 
-         真正该做的是**换一种窗口**：compositor 不存在时透明窗口必然 map 失败，
-         唯一的出路是不透明窗口。这一步只做一次（state.opaque 守卫）。 */
+    /* ⚠ _NET_CLIENT_LIST 不是唯一证据，这点很关键：
+       在 GNOME Shell + XWayland 下，mutter 只把 **NORMAL 类型**的窗口写进
+       _NET_CLIENT_LIST；type:'toolbar' 的窗口能创建、能渲染、像素都在，
+       但永远不会进列表 → 一直报 NOT_MAPPED，而它可能其实就在屏幕上。
+
+       所以再查一层：窗口树里属于本 PID、且 map_state==2(IsViewable) 的窗口
+       也算"可见"。两个证据任一成立都算 OK；都失败才真的报错。 */
+    const treeVisible = (r.ownWindows || []).some((w) => w && w.map_state === 2);
+    if (!r.mapped && treeVisible) {
+      log('→ _NET_CLIENT_LIST 没收录，但窗口树里 IsViewable —— 已可见（mutter 对非 NORMAL 类型不登记）');
+      return;
+    }
+    if (!r.mapped) {
+      /* 走到这里说明：Electron 侧全绿，X 上也真没映射。
+         ⚠ 不要再 reloadIgnoringCache / 关 GPU —— 实测无效，
+         而且会把页面状态整个重来一遍，把诊断信息冲掉。 */
       log('⚠ 窗口未映射到 X —— 屏幕上看不到球（Electron isVisible 会骗人）');
-      const env = r.env || {};
-      if (env.compositor === false && !state.opaque) {
-        log('→ 定位：_NET_WM_CM_S0 不存在，X 上没有合成器，'
-          + 'transparent:true 的窗口无法 present。改为不透明窗口重建。');
-        rebuildOpaque();
-        return;
-      }
       send({ type: 'diag', warn: 'window-not-mapped', via: r.via, scanned: r.scanned });
     }
   };
@@ -755,27 +758,38 @@ function probePixels() {
       const met = a.metrics || {};
       const bandH = Math.max(1, Math.round((met.dockH || 38) + (met.lift || 19)));
       const bandTop = Math.max(0, size.height - bandH);
+      /* ⚠ 不能只数 alpha>16 就完事：
+         不透明降级后窗口底色 #1e1e22 本身 alpha=255，于是"整窗 100% 不透明"
+         —— 这个指标会告诉你"有东西"，但那个东西只是背景板，球可能根本不在。
+         实测就踩到了：600/600 (100%)，可球一个像素都没有。
+         所以再按"饱和度/亮度是否偏离中性灰"数一遍：底色是近中性深灰，
+         球是 hsl(46~72% 饱和) 的彩色，用 max-min 通道差就能分开。 */
       let opaque = 0;
       let total = 0;
-      let sampled = 0;
-      for (let y = bandTop; y < size.height; y += 2) {
-        for (let x = 0; x < size.width; x += 2) {
+      let colored = 0; // 真正像"球"的像素（有彩度 / 明显亮于底色）
+      for (let y = bandTop; y < size.height; y += 1) {
+        for (let x = 0; x < size.width; x += 1) {
           const i = (y * size.width + x) * 4;
+          const b = bmp[i];
+          const g = bmp[i + 1];
+          const r = bmp[i + 2];
           const al = bmp[i + 3];
           total++;
-          if (al > 16) {
-            opaque++;
-            sampled = Math.max(sampled, 1);
-          }
+          if (al > 16) opaque++;
+          const mx = Math.max(r, g, b);
+          const mn = Math.min(r, g, b);
+          // 彩度 > 24 且不太暗：球的高光/本体都会落在这一档
+          if (al > 16 && mx - mn > 24 && mx > 60) colored++;
         }
       }
-      const pct = total ? (opaque / total) : 0;
-      log('像素体检: 球带不透明像素 ' + opaque + '/' + total +
-        ' (' + (pct * 100).toFixed(2) + '%)  band=' + JSON.stringify({
+      const pct = total ? (colored / total) : 0;
+      log('像素体检: 球带彩色像素 ' + colored + '/' + total +
+        ' (' + (pct * 100).toFixed(2) + '%)  含底色不透明 ' + opaque +
+        '  band=' + JSON.stringify({
           top: bandTop, h: size.height - bandTop, dockH: Math.round(met.dockH || 0),
         }) + ' view=' + JSON.stringify({ w: size.width, h: size.height }));
-      if (opaque === 0) {
-        log('⚠ 球带区域一个不透明像素都没有 —— 球确实没画出来（不是"位置不对"）');
+      if (colored === 0) {
+        log('⚠ 球带里没有任何彩色像素 —— 球确实没画出来（只有底色板）');
         send({ type: 'diag', warn: 'orbs-invisible-pixels' });
       }
     })
@@ -815,7 +829,19 @@ function createWindow() {
     /* 不透明降级时给一个深色底：球是浅色的，贴在深底上比白底清楚得多，
        也更接近"悬浮条"的观感（而不是一块白板）。 */
     backgroundColor: state.opaque ? '#1e1e22' : '#00000000',
-    type: 'toolbar',
+    /* ⚠ type:'toolbar' 在 GNOME Shell (mutter) + XWayland 下**不会被托管**：
+       窗口能创建、能渲染、pixels 都在，但 mutter 不把它写进 _NET_CLIENT_LIST，
+       就等于没有 map 到屏幕 —— 于是"球明明画出来了却看不见"。
+
+       实测证据（xprop -root）：
+         _NET_SUPPORTING_WM_CHECK = "GNOME Shell"   ← mutter 在
+         _NET_WM_CM_S0            = not found       ← XWayland 下本来就没有
+         _NET_CLIENT_LIST         = 只有 3 个窗口，全是 _NET_WM_WINDOW_TYPE_NORMAL
+       而我们那个是 TOOLBAR，一个都没进列表。
+
+       所以走 NORMAL（mutter 一定托管），要的"工具窗"效果改用
+       skipTaskbar + alwaysOnTop + focusable:false 组合来实现。 */
+    type: process.platform === 'linux' ? 'normal' : 'toolbar',
     webPreferences: {
       // ⚠ preload 漏了 = 页面上没有 window.orbs，第一行 post('ready') 就抛
       // "Cannot read properties of undefined (reading 'send')"，球永远画不出来。

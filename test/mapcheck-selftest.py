@@ -153,6 +153,27 @@ ok("输出携带 ownWindows/ownCount（区分「没创建」与「创建了没 m
    isinstance((r6 or {}).get("ownCount"), int) and isinstance((r6 or {}).get("ownWindows"), list),
    {"ownCount": (r6 or {}).get("ownCount")})
 
+# ── L7 树扫描必须真的扫到东西（回归：at.depth 抛 AttributeError 被吞） ──
+# 曾经用裸 except: pass，一个属性名写错就让整个列表恒为空，
+# 而外部看起来只是"ownCount: 0"，跟"确实没有窗口"长得一模一样。
+if target_pid:
+    rt = parse(run(args=[str(target_pid)]))
+    ok("ownCount 能扫到自己的窗口（不能恒为 0）",
+       isinstance((rt or {}).get("ownCount"), int) and rt["ownCount"] > 0,
+       {"ownCount": (rt or {}).get("ownCount"), "own": (rt or {}).get("ownWindows")})
+    ok("ownWindows 每项都带 map_state（0/1/2）",
+       all(isinstance(w.get("map_state"), int) for w in ((rt or {}).get("ownWindows") or []))
+       and bool((rt or {}).get("ownWindows")), (rt or {}).get("ownWindows"))
+    ok("ownViewable 与 ownWindows 内的 IsViewable 数量一致",
+       (rt or {}).get("ownViewable") == sum(
+           1 for w in ((rt or {}).get("ownWindows") or []) if w.get("map_state") == 2),
+       {"ownViewable": (rt or {}).get("ownViewable")})
+    ok("ownWindows 与 windows（client list）口径一致 —— 后者非空时前者必有 viewable",
+       not (rt or {}).get("mapped") or ((rt or {}).get("ownViewable") or 0) > 0,
+       {"mapped": (rt or {}).get("mapped"), "ownViewable": (rt or {}).get("ownViewable")})
+else:
+    ok("（跳过）无已 map 窗口可测树扫描", True)
+
 # 交叉验证：直接问 xprop，与脚本自报必须一致
 if shutil.which("xprop"):
     cm = subprocess.run(["xprop", "-root", "_NET_WM_CM_S0"],

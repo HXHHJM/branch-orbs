@@ -31,21 +31,51 @@ def emit(obj):
     sys.exit(0)
 
 
-def list_clients_xlib():
-    """返回 [(win_id, pid, (x,y,w,h), map_state)]；不可用返回 None。"""
+_DISP = None
+
+
+def get_display():
+    """进程内复用同一个 X 连接。
+
+    ⚠ 踩过：list_clients_xlib 与 xlib_detail 各自 display.Display() 一次，
+      第二个连接在部分环境会建不起来（返回 None），于是
+      "clients 里有自己的窗口，ownWindows 却是 0" —— 两个函数互相打脸。
+      共用一个连接就没有这个窗口期问题。
+    """
+    global _DISP
+    if _DISP is not None:
+        return _DISP
     try:
-        from Xlib import X, display
+        from Xlib import display
+        _DISP = display.Display(os.environ.get("DISPLAY", ":0"))
+    except Exception:
+        _DISP = None
+    return _DISP
+
+
+def list_clients_xlib():
+    """返回 [(win_id, pid, (x,y,w,h), map_state)]；不可用返回 None。
+
+    注意：这里遍历的是**整棵窗口树**，未映射窗口也会被收进来。
+    调用方按 map_state 过滤。之所以不用 _NET_CLIENT_LIST，
+    是因为那个列表在 GNOME/XWayland 下只收 NORMAL 类型的窗口。
+    """
+    try:
+        from Xlib import X
     except Exception:
         return None
-    try:
-        d = display.Display(os.environ.get("DISPLAY", ":0"))
-    except Exception:
+    d = get_display()
+    if d is None:
         return None
     root = d.screen().root
     out = []
+    pid_atom = d.intern_atom("_NET_WM_PID")
 
     def walk(w, dep=0):
-        if dep > 4:
+        # ⚠ 用 dep 上限保护递归深度，但**不能 return 掉 for 循环**
+        #   （首版写法是 `if dep > 4: return`，它会让同层后续兄弟节点被跳过，
+        #    于是 gnome-shell 的窗口在客户端列表里出现、在 ownWindows 里却是 0）。
+        if dep > 5:
             return
         try:
             children = w.query_tree().children
@@ -53,7 +83,7 @@ def list_clients_xlib():
             return
         for c in children:
             try:
-                pm = c.get_full_property(d.intern_atom("_NET_WM_PID"), X.AnyPropertyType)
+                pm = c.get_full_property(pid_atom, X.AnyPropertyType)
                 pid = int(pm.value[0]) if pm and pm.value else None
                 g = c.get_geometry()
                 st = c.get_attributes().map_state
@@ -96,53 +126,69 @@ def xprop_value(name, wid=None):
 
 
 def xlib_detail():
-    """除"在不在 client list"之外，再单独扫一遍窗口树，给出**每个**自己的窗口的
-    详细状态。这一步是本轮排查的关键：
+    """给出**每个**窗口的详细状态（含未映射的、含 override_redirect）。
 
-      _NET_CLIENT_LIST 只收**已映射**的窗口，所以"不在里面"既可能是
-      "窗口没创建"，也可能是"创建了但 map 失败"。两者处置完全不同，
-      只看 NOT_MAPPED 永远分不清，就会一直在错的方向上改代码。
+    为什么不能只看 _NET_CLIENT_LIST：它只收 mutter 愿意托管的窗口
+    （GNOME/XWayland 下基本只收 NORMAL 类型），所以"不在里面"既可能是
+    "窗口没创建"，也可能是"创建了但没登记/没 map"，处置完全不同。
 
-    返回 {"clients": [...]|None, "mine": [{id,state,override,geom,attrs...}]}
+    ⚠ 复用一个 Display 连接，不要跟 list_clients_xlib 各连一次：
+      两次快照之间窗口状态可能变化，对不上就会得出自相矛盾的结论
+      （实测发生过：clients 里有 gnome-shell 的窗口，ownWindows 却是 0）。
     """
     try:
-        from Xlib import X, display
+        from Xlib import X
     except Exception:
         return None
-    try:
-        d = display.Display(os.environ.get("DISPLAY", ":0"))
-    except Exception:
+    d = get_display()
+    if d is None:
         return None
     root = d.screen().root
+    pid_atom = d.intern_atom("_NET_WM_PID")
+    acc = []
+    # ⚠ 不能写裸 `except: pass`：本轮就因为它把一个
+    #   "at.depth 抛 AttributeError" 的 bug 藏了整整一轮排查，
+    #   表现只是"列表空空"，看起来像"没有窗口"。
+    #   现在把跳过的窗口数和第一个错误记下来，一起输出。
+    skipped = []
 
-    def walk(w, dep=0, acc=None):
-        acc = acc if acc is not None else []
+    def walk(w, dep=0):
         if dep > 5:
-            return acc
+            return
         try:
             children = w.query_tree().children
-        except Exception:
-            return acc
+        except Exception as e:
+            skipped.append("tree:" + type(e).__name__)
+            return
         for c in children:
             try:
-                pm = c.get_full_property(d.intern_atom("_NET_WM_PID"), X.AnyPropertyType)
+                pm = c.get_full_property(pid_atom, X.AnyPropertyType)
                 pid = int(pm.value[0]) if pm and pm.value else None
                 g = c.get_geometry()
                 at = c.get_attributes()
+                # ⚠ WindowAttributes 没有 .depth！写 at.depth 会抛 AttributeError，
+                #   而 except: pass 会把它静默吞掉 —— 表现是
+                #   "xlib_detail() 永远返回空列表"，被误读成"没有窗口"。
+                #   深度要从 geometry 取（get_geometry 才有 depth）。
                 acc.append({
                     "id": hex(c.id),
                     "pid": pid,
                     "map_state": at.map_state,       # 0=未映射 1=IsUnmapped 2=IsViewable
                     "override_redirect": bool(at.override_redirect),
-                    "depth": at.depth,
+                    "depth": getattr(g, "depth", None),
                     "geom": [g.x, g.y, g.width, g.height],
                 })
-            except Exception:
-                pass
-            walk(c, dep + 1, acc)
-        return acc
+            except Exception as e:
+                if len(skipped) < 5:
+                    skipped.append(hex(c.id) + ":" + type(e).__name__)
+            walk(c, dep + 1)
 
-    return walk(root)
+    walk(root)
+    xlib_detail.last_skipped = skipped
+    return acc
+
+
+xlib_detail.last_skipped = []
 
 
 def wm_env():
@@ -245,14 +291,17 @@ def main():
             "via": via,
             "scanned": len(clients),
         }
-        # 详细树扫描：只走得到 xlib 时做一次，用来说明"未映射"到底是哪种
-        # —— 窗口根本没创建 / 创建了但 map_state != IsViewable。
         if via == "xlib":
+            # 关键：xlib 路径下 clients 本来就是**整棵树**（含未映射窗口），
+            # 直接在这里分出"属于本进程的所有窗口"，不必再走一遍。
+            # ⚠ 但要补上 override_redirect/depth 这些只有 attributes 才有的字段，
+            #   所以仍调 xlib_detail() 一次（开销可忽略，只在启动时跑）。
             tree = xlib_detail()
             if tree is not None:
                 own = [w for w in tree if w.get("pid") == want]
                 res["ownWindows"] = own[:6]
                 res["ownCount"] = len(own)
+                res["ownViewable"] = sum(1 for w in own if w.get("map_state") == 2)
                 res["env"] = wm_env()
         emit(res)
 
