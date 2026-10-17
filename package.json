@@ -42,6 +42,22 @@
         "category": "Branch Orbs"
       },
       {
+        "command": "branchOrbs.pick",
+        "title": "跳转到仓库…",
+        "category": "Branch Orbs",
+        "icon": "$(list-flat)"
+      },
+      {
+        "command": "branchOrbs.focusRepo",
+        "title": "跳转到指定仓库（内部）",
+        "category": "Branch Orbs"
+      },
+      {
+        "command": "branchOrbs.dotActive",
+        "title": "切换当前仓库的悬浮球（内部）",
+        "category": "Branch Orbs"
+      },
+      {
         "command": "branchOrbs.refresh",
         "title": "刷新",
         "category": "Branch Orbs",

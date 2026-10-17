@@ -109,22 +109,42 @@ node test/activate-selftest.js --workspace /path/to/your/repo
 界面上既没有球也没有报错，用户看到的现象跟"扩展没装"完全一样。
 （真实踩过：`warned` 声明在使用它的函数之后，撞 `const` 的 TDZ，activate 直接中断。）
 
-## 状态栏豆子：看不到球时的第一手信号
+## 状态栏豆子：**有几个仓库就有几颗豆子**
 
-激活时会在状态栏右侧常驻一颗豆子，内容就是当前分支名：
+激活时会在状态栏右侧为**每个识别到的仓库**常驻一颗豆子，各显示自己的分支名：
 
 ```
-$(circle-large-filled) new_s11x_motor
+$(circle-large-filled) new_s11x_motor ●   $(circle-large-filled) master   $(circle-large-filled) dev
 ```
 
-- **点击** → 显示/隐藏悬浮球（等同 `Branch Orbs: 显示/隐藏悬浮球`）
-- **悬停** → 分支、领先/落后、改动文件数、增删行数、最近一条提交
-- 没识别到仓库时显示 `$(circle-large-outline) Branch Orbs`
+- **活动仓库排最右**（状态栏从右往左读，第一眼看到的就是当前文件所在的仓库）
+- 分支名后的 `●` = 这个仓库有未提交改动
+- **点活动仓库那颗** → 显示/隐藏悬浮球
+- **点其他仓库那颗** → 跳到那个仓库（已在本工作区就切 SCM 视图，否则新窗口打开）
+- **悬停任意一颗** → 该仓库的分支、领先/落后、改动文件数、增删行数、最近一条提交
+- 豆子上限 12 颗，多出来的折成一颗 `$(ellipsis) +N`（点开是仓库列表）
+
+豆子的 `name` 是 `Branch Orbs · 当前 · <仓库名>` / `Branch Orbs · <仓库名>`，
+所以右键状态栏 → 可以**单独**隐藏某一个仓库的豆子，不影响其他。
+
+### 跨窗口：开了几个 VSCode 窗口，就汇总几个窗口的仓库
+
+每个 VSCode 窗口把自己的仓库快照写到
+`~/.vscode-branch-orbs/branch-orbs-windows/<windowId>.json`（15s 心跳），
+再读回所有人的条目合并显示。所以：
+
+- 三个窗口各开一个工程 → 状态栏三颗豆子、屏幕底部三颗球
+- 窗口关掉 → 自己的条目被摘除，其他窗口的豆子立刻少一颗（另有 45s TTL 兜住崩溃退出的情况）
+- 同一个仓库被两个窗口打开 → 只显示一颗（按 root 去重）
+
+没识别到仓库时显示 `$(circle-large-outline) Branch Orbs`；
+还没读完（首次启动 VSCode 很慢，实测要 48~66 秒）显示 `$(sync~spin) Branch Orbs 读取中`。
 
 有了它，即使悬浮球被其他窗口盖住、或 Electron 起不来，你也能立刻确认：
-**扩展活着、git 读到了、分支是哪个**。
+**扩展活着、git 读到了、一共几个仓库、各自在哪个分支**。
 
-打包：`npm run package`（或 `npx vsce package --no-dependencies --allow-missing-repository`）。
+打包：`node scripts/pack.js`（离线自打包，不依赖 npm registry）
+或 `npm run package`（需要能联网装 vsce）。
 
 ## License
 

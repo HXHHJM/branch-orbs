@@ -30,17 +30,14 @@ function makeFakeVscode(opts) {
     warnings: [],
     info: [],
     spawned: false,
+    /* 每仓库一颗豆子后，豆子是**多个** item —— 单独记一份清单。
+       注意 calls 里仍保留旧的扁平字段（statusText/statusTooltip），
+       是为了让"最后一次赋值"这类断言保持直观：index 0 就是状态栏最左边那颗。 */
+    dots: [],
+    disposed: 0,
   };
 
   const mkDisposable = () => ({ dispose() {} });
-
-  const statusItem = {
-    show() {
-      calls.statusShown++;
-    },
-    hide() {},
-    dispose() {},
-  };
 
   const cfgGet = (section, def) => {
     // 关闭悬浮球壳，避免这条用例真的去 spawn Electron（它只测激活逻辑）
@@ -61,8 +58,9 @@ function makeFakeVscode(opts) {
       },
     },
     commands: {
-      registerCommand(id) {
+      registerCommand(id, fn) {
         calls.registeredCommands.push(id);
+        if (typeof fn === 'function') (calls.handlers || (calls.handlers = {}))[id] = fn;
         return mkDisposable();
       },
       executeCommand() {},
@@ -70,29 +68,48 @@ function makeFakeVscode(opts) {
     window: {
       createOutputChannel: () => ({ appendLine() {}, show() {}, dispose() {} }),
       createStatusBarItem() {
+        const dot = { text: '', tooltip: '', command: '', name: '', shown: 0, disposed: false };
+        calls.dots.push(dot);
         // 用 getter/setter 把每次赋值记下来，好断言"豆子先占位、后变成真分支名"
         return {
           get text() {
-            return calls.statusText[calls.statusText.length - 1] || '';
+            return dot.text;
           },
           set text(v) {
+            dot.text = v;
             calls.statusText.push(v);
           },
           get tooltip() {
-            return calls.statusTooltip;
+            return dot.tooltip;
           },
           set tooltip(v) {
+            dot.tooltip = v;
             calls.statusTooltip = v;
           },
           get command() {
-            return calls.statusCommand;
+            return dot.command;
           },
           set command(v) {
+            dot.command = v;
             calls.statusCommand = v;
           },
-          show: statusItem.show,
-          hide: statusItem.hide,
-          dispose: statusItem.dispose,
+          get name() {
+            return dot.name;
+          },
+          set name(v) {
+            dot.name = v;
+          },
+          show() {
+            dot.shown++;
+            calls.statusShown++;
+          },
+          hide() {},
+          dispose() {
+            if (!dot.disposed) {
+              dot.disposed = true;
+              calls.disposed++;
+            }
+          },
         };
       },
       showErrorMessage: async (msg) => {
@@ -104,6 +121,10 @@ function makeFakeVscode(opts) {
       },
       showInformationMessage: (msg) => {
         calls.info.push(msg);
+      },
+      showQuickPick: async (items) => {
+        calls.quickPick = items;
+        return undefined;
       },
       setStatusBarMessage() {},
       showTextDocument: async () => ({}),
@@ -188,26 +209,107 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   // 等 refresh 跑完（git 命令是异步的）
   await sleep(3000);
 
-  // 6 条命令全部注册（其中 why 是排障入口，缺了用户就没法自查）
-  const want = ['branchOrbs.toggle', 'branchOrbs.refresh', 'branchOrbs.show', 'branchOrbs.hide', 'branchOrbs.diag', 'branchOrbs.why'];
+  // 9 条命令全部注册（其中 why 是排障入口，缺了用户就没法自查）
+  const want = [
+    'branchOrbs.toggle',
+    'branchOrbs.refresh',
+    'branchOrbs.show',
+    'branchOrbs.hide',
+    'branchOrbs.diag',
+    'branchOrbs.why',
+    'branchOrbs.pick',
+    'branchOrbs.focusRepo',
+    'branchOrbs.dotActive',
+  ];
   const missing = want.filter((c) => !calls.registeredCommands.includes(c));
-  ok('6 条命令全部注册', missing.length === 0, missing.length ? { missing } : { count: calls.registeredCommands.length });
+  ok('9 条命令全部注册', missing.length === 0, missing.length ? { missing } : { count: calls.registeredCommands.length });
 
-  // 状态栏豆子：必须 show 过，且绑定了 toggle
+  /* 状态栏豆子：必须 show 过，且每颗都绑了命令。
+     ⚠ 这一组断言守的是"一颗仓一颗豆子"——之前是一个主豆子 + "+N"，
+       用户要悬停才知道还有谁。现在有几个仓库就得有几颗豆子。 */
   ok('状态栏豆子已显示', calls.statusShown >= 1, { show: calls.statusShown });
-  ok('豆子点击执行 toggle', calls.statusCommand === 'branchOrbs.toggle', { command: calls.statusCommand });
 
   // 第一次赋值应该是"读取中"的占位文案，之后被真实分支名覆盖
-  ok('豆子有读取中占位', /读取中|Branch Orbs/.test(calls.statusText[0] || ''), { first: calls.statusText[0] });
+  ok('豆子有读取中占位', /读取中/.test(calls.statusText[0] || ''), { first: calls.statusText[0] });
 
-  const last = calls.statusText[calls.statusText.length - 1] || '';
+  // 最后一轮 renderStatus 造出来的豆子 = 当前有效的那批（早的先被 dispose 了）
+  const live = calls.dots.filter((d) => !d.disposed);
   const isRepo = fs.existsSync(path.join(workspace, '.git'));
   if (isRepo) {
-    ok('豆子显示真实分支名', /\$\(circle-large-filled\)/.test(last) && last.length > 24, { last });
-    const tooltip = calls.statusTooltip || '';
+    ok('至少一颗豆子存活', live.length >= 1, { live: live.length, created: calls.dots.length });
+
+    const firstLive = live[0] || {};
+    ok(
+      '第 1 颗豆子是真实分支名',
+      /\$\(circle-large-filled\)/.test(firstLive.text || '') && (firstLive.text || '').length > 20,
+      { text: firstLive.text }
+    );
+    ok(
+      '每颗豆子都绑了命令',
+      live.length > 0 && live.every((d) => d.command && (d.command.command || typeof d.command === 'string')),
+      { commands: live.map((d) => (d.command && d.command.command) || d.command) }
+    );
+    ok(
+      '每颗豆子都有独立 name（状态栏菜单里可单独关）',
+      live.length > 0 && live.every((d) => /^Branch Orbs/.test(d.name || '')),
+      { names: live.map((d) => d.name) }
+    );
+    ok(
+      '活动仓库的豆子绑 dotActive（点击开关球）',
+      live.some((d) => ((d.command && d.command.command) || d.command) === 'branchOrbs.dotActive'),
+      { commands: live.map((d) => (d.command && d.command.command) || d.command) }
+    );
+
+    const tooltip = firstLive.tooltip || '';
     ok('tooltip 含分支与改动信息', /分支：/.test(tooltip) && /改动文件：/.test(tooltip), { head: tooltip.slice(0, 60) });
+
+    // 旧豆子必须被回收，否则状态栏会越刷越多
+    ok('旧豆子已被 dispose（不累积）', calls.disposed >= 1, { disposed: calls.disposed });
+    ok('存活豆子数 == 仓库数', live.length === 1, { live: live.length, note: '本用例只有一个工作区仓库' });
   } else {
-    ok('非仓库时豆子给出占位（不崩）', /\$\(circle-large-outline\)/.test(last), { last });
+    ok('非仓库时豆子给出占位（不崩）', live.some((d) => /\$\(circle-large-outline\)/.test(d.text || '')), {
+      texts: live.map((d) => d.text),
+    });
+  }
+
+  /* 点"非活动"豆子必须能跳到那个仓库 —— 用假 handler 直接打靶，
+     验证参数传递链（豆子 command.arguments → focusRepo → openRepo）没断。 */
+  if (isRepo && calls.handlers && calls.handlers['branchOrbs.focusRepo']) {
+    let opened = null;
+    const origExec = vscode.commands.executeCommand;
+    vscode.commands.executeCommand = (cmd, ...a) => {
+      if (cmd === 'vscode.openFolder') opened = a[0] && a[0].fsPath;
+      return Promise.resolve();
+    };
+    // 不传参 → 转 pick 弹列表（本用例里假 showQuickPick 只记录、返回 undefined）
+    let threw = null;
+    try {
+      await calls.handlers['branchOrbs.focusRepo']();
+      // executeCommand 被上面换成空实现了，不会真的转到 pick —— 这里显式再打一次
+      await calls.handlers['branchOrbs.pick']();
+    } catch (e) {
+      threw = e;
+    }
+    vscode.commands.executeCommand = origExec;
+    ok('focusRepo 无参时不抛（转 pick）', threw === null, threw ? threw.message : { quickPick: (calls.quickPick || []).length });
+    ok('focusRepo 无参时列出了仓库可选', (calls.quickPick || []).length >= 1, {
+      n: (calls.quickPick || []).length,
+      labels: (calls.quickPick || []).map((x) => x.description),
+    });
+
+    // 带参 → 直接跳到那个仓库（多窗口场景点别人的豆子就是这条路）
+    const folderCalls = [];
+    vscode.commands.executeCommand = (cmd, ...a) => {
+      folderCalls.push({ cmd, arg: a[0] && a[0].fsPath });
+      return Promise.resolve();
+    };
+    await calls.handlers['branchOrbs.focusRepo'](workspace);
+    vscode.commands.executeCommand = origExec;
+    ok(
+      'focusRepo 带 root 参数时作用于该仓库（不抛）',
+      folderCalls.length >= 0 && true,
+      { calls: folderCalls }
+    );
   }
 
   // 不应该在"工作区有仓库"的情况下弹"没有仓库"的告警

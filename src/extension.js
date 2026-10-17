@@ -150,16 +150,19 @@ function activate(context) {
      ⚠ 踩过的坑：悬浮球是**另一个进程画的窗口**，它可能被别的窗口盖住、
        可能因为找不到 Electron 起不来、也可能飘在屏幕边缘用户根本没注意。
        一旦如此，用户界面上就"什么都没有"，看起来像扩展没装。
-       所以这里在 VSCode 自己的状态栏常驻一颗豆子 —— 它在编辑器里一定可见，
-       点一下就能显示/隐藏悬浮球。球没出来时，用户至少知道扩展活着。 */
-  rawLog('creating statusItem…');
-  let statusItem = null;
+       所以这里在 VSCode 自己的状态栏常驻豆子 —— 它在编辑器里一定可见，
+       点一下就能显示/隐藏悬浮球。球没出来时，用户至少知道扩展活着。
+
+     历史上这里先造过一个"探针"item（只用来验证 createStatusBarItem 能不能用），
+     后来豆子改成每仓库一颗，那个探针就变成了多出来的一颗空豆子 —— 已删除。
+     现在 statusBarOk 只作为"状态栏 API 是否可用"的标记，不再持有 item。 */
+  let statusBarOk = true;
   try {
-    statusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
-    statusItem.command = 'branchOrbs.toggle';
-    statusItem.name = 'Branch Orbs';
-    rawLog('statusItem created ok');
+    const probe = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
+    probe.dispose(); // 立刻回收：它只用来确认 API 可用
+    rawLog('createStatusBarItem ok');
   } catch (e) {
+    statusBarOk = false;
     rawLog('createStatusBarItem 失败：' + e.message);
   }
 
@@ -169,39 +172,119 @@ function activate(context) {
      中间这段空白期如果显示"没有仓库"，会被误判成故障。 */
   let firstRefreshDone = false;
 
+  /* ── 一颗仓库一颗豆子 ──
+     ⚠ 别再用一个主豆子 + "+N" 汇总了：用户真正想看的是"我现在开了几个仓库"，
+       "+N" 还要悬停才知道是谁。这里改成**每个仓库一个 StatusBarItem**，
+       数量随跨窗口注册表变化而增减。
+
+     为什么不用 map 缓存（复用旧 item）：
+       状态栏里 item 的顺序 = show() 的先后顺序。缓存复用会让顺序固定在
+       第一次创建的顺序上，仓库切换/增删后顺序就乱了。
+       VSCode 的 StatusBarItem 很轻（只是个字符串 + tooltip），
+       每次 refresh 全量 dispose 重建最省心，也不会泄漏 —— dispose 都记在数组里。
+
+     name 很重要：它是无障碍读屏和"隐藏状态栏项"菜单里显示的名字，
+     不设的话多颗豆子在菜单里全叫 "Branch Orbs"，用户没法单独关掉某一颗。 */
+  const MAX_STATUS_DOTS = 12; // 太多豆子会把状态栏挤爆，超出的并成一颗 "+N"
+  let statusDots = [];
+  function disposeDots() {
+    for (const it of statusDots) {
+      try {
+        it.dispose();
+      } catch (_) {}
+    }
+    statusDots = [];
+  }
+
+  /** 一颗豆子的 tooltip：这个仓库的全部信息 */
+  function repoLines(r, idx, total) {
+    const lines = [
+      'Branch Orbs（点击显示/隐藏悬浮球）',
+      '仓库：' + r.name + '  (' + r.root + ')',
+      '分支：' + r.branch + (r.isActive ? '  ← 当前文件' : ''),
+    ];
+    if (r.detached) lines.push('（detached HEAD）');
+    if (r.ahead || r.behind) lines.push('领先 ' + r.ahead + ' / 落后 ' + r.behind);
+    lines.push('改动文件：' + (r.changed || 0) + '   增删行：+' + (r.added || 0) + ' -' + (r.deleted || 0));
+    if (r.lastCommit) lines.push('最近：' + r.lastCommit.subject + '  (' + r.lastCommit.when + ')');
+    if (r.error) lines.push('⚠ ' + r.error);
+    if (total > 1) {
+      const wins = diagnostic.windows || [];
+      lines.push('');
+      lines.push(
+        '第 ' + (idx + 1) + ' / ' + total + ' 颗豆子' +
+          (wins.length > 1 ? '（共 ' + wins.length + ' 个 VSCode 窗口）' : '')
+      );
+    }
+    return lines.join('\n');
+  }
+
+  /** 兜底豆子：读取中 / 无仓库 / 溢出汇总，统一在这里造 */
+  function makeDot(text, tooltip, cmd, name) {
+    const it = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
+    it.text = text;
+    it.tooltip = tooltip;
+    it.command = cmd || 'branchOrbs.toggle';
+    it.name = name || 'Branch Orbs';
+    it.show();
+    statusDots.push(it);
+    return it;
+  }
+
   function renderStatus() {
-    if (!statusItem) return;
+    if (!statusBarOk) return;
     try {
+      disposeDots();
+
       const repos = diagnostic.repos || [];
-      const r = repos.find((x) => x.isActive) || repos[0];
-      if (!r) {
+      if (repos.length === 0) {
         if (!firstRefreshDone) {
-          statusItem.text = '$(sync~spin) Branch Orbs 读取中';
-          statusItem.tooltip = 'Branch Orbs 正在读取 git 仓库…（首次启动 VSCode 较慢，请稍候）';
+          makeDot('$(sync~spin) Branch Orbs 读取中', 'Branch Orbs 正在读取 git 仓库…（首次启动 VSCode 较慢，请稍候）');
         } else {
-          statusItem.text = '$(circle-large-outline) Branch Orbs';
-          statusItem.tooltip = '没有识别到 git 仓库。点击这里在状态栏切换悬浮球，或运行「Branch Orbs: 自检」排查。';
+          makeDot(
+            '$(circle-large-outline) Branch Orbs',
+            '没有识别到 git 仓库。点击这里在状态栏切换悬浮球，或运行「Branch Orbs: 自检」排查。'
+          );
         }
-      } else {
-        const extra = repos.length > 1 ? ' +' + (repos.length - 1) : '';
-        statusItem.text = '$(circle-large-filled) ' + r.branch + extra;
-        const lines = [
-          'Branch Orbs（点击显示/隐藏悬浮球）',
-          '分支：' + r.branch + (r.isActive ? '  ← 当前文件' : ''),
-        ];
-        if (r.ahead || r.behind) lines.push('领先 ' + r.ahead + ' / 落后 ' + r.behind);
-        lines.push('改动文件：' + (r.changed || 0) + '   增删行：+' + (r.added || 0) + ' -' + (r.deleted || 0));
-        if (r.lastCommit) lines.push('最近：' + r.lastCommit.subject + '  (' + r.lastCommit.when + ')');
-        if (repos.length > 1) {
-          lines.push('');
-          const wins = diagnostic.windows || [];
-          lines.push('全部仓库（' + repos.length + ' 个' + (wins.length > 1 ? '，来自 ' + wins.length + ' 个 VSCode 窗口' : '') + '）：');
-          for (const x of repos) lines.push('  · ' + x.name + '  [' + x.branch + ']');
-        }
-        statusItem.tooltip = lines.join('\n');
+        return;
       }
-      statusItem.show();
-      rawLog('renderStatus shown: ' + statusItem.text);
+
+      /* 活动仓库排最前 —— 状态栏从右往左读，用户最关心当前文件所在的仓库。
+         其余保持注册表的顺序（isActive 优先 → 名字字典序）。 */
+      const ordered = repos.slice().sort((a, b) => (b.isActive ? 1 : 0) - (a.isActive ? 1 : 0));
+      const shown = ordered.slice(0, MAX_STATUS_DOTS);
+      const hidden = ordered.length - shown.length;
+
+      for (let i = 0; i < shown.length; i++) {
+        const r = shown[i];
+        // 有改动就在分支名后加 ●，一眼能看出哪个工程是脏的
+        const dirty = (r.changed || 0) > 0 ? ' ●' : '';
+        const icon = r.error ? '$(warning)' : '$(circle-large-filled)';
+        const text = icon + ' ' + r.branch + dirty;
+        makeDot(
+          text,
+          repoLines(r, i, ordered.length),
+          // command 可以带参数：VSCode 会把它原样传给注册的函数
+          { command: r.isActive ? 'branchOrbs.dotActive' : 'branchOrbs.focusRepo', arguments: [r.root], title: 'Branch Orbs' },
+          (r.isActive ? 'Branch Orbs · 当前 · ' : 'Branch Orbs · ') + r.name
+        );
+      }
+
+      if (hidden > 0) {
+        const rest = ordered.slice(MAX_STATUS_DOTS);
+        const wins = diagnostic.windows || [];
+        makeDot(
+          '$(ellipsis) +' + hidden,
+          ['还有 ' + hidden + ' 个仓库没在状态栏显示（上限 ' + MAX_STATUS_DOTS + ' 颗）：']
+            .concat(rest.map((x) => '  · ' + x.name + '  [' + x.branch + ']'))
+            .concat(wins.length > 1 ? ['', '共 ' + wins.length + ' 个 VSCode 窗口'] : [])
+            .join('\n'),
+          'branchOrbs.why',
+          'Branch Orbs · 其余仓库'
+        );
+      }
+
+      rawLog('renderStatus: ' + shown.length + ' 颗豆子' + (hidden ? ' +' + hidden + ' 折叠' : ''));
     } catch (e) {
       rawLog('renderStatus 抛异常：' + e.message);
     }
@@ -402,8 +485,7 @@ function activate(context) {
         const repo = m.repo || diagnostic.repos[m.index];
         if (repo) openRepo(repo);
         break;
-      }
-      case 'menu': {
+      }      case 'menu': {
         const repo = diagnostic.repos[m.index];
         if (m.action === 'copy' && repo) {
           vscode.env.clipboard.writeText(repo.branch);
@@ -483,11 +565,16 @@ function activate(context) {
         log('discover failed', e.message);
       }
       const activeRoot = aDir ? gitModel.findGitRoot(aDir) : null;
+      /* 没有活动编辑器时（刚打开窗口、焦点在欢迎页）aDir 是 null，
+         这时**不能**把所有仓库都标成 isActive=false —— 用户会看到
+         一排豆子谁都不高亮，而且点击行为也会退化成"跳文件"。
+         退一步：如果工作区只有一个仓库，它显然就是"当前仓库"。 */
+      const soleRepo = roots.length === 1 ? roots[0] : null;
       const repos = [];
       for (const r of roots) {
         try {
           const info = await gitModel.readRepo(model, r);
-          info.isActive = !!activeRoot && r === activeRoot;
+          info.isActive = activeRoot ? r === activeRoot : r === soleRepo;
           repos.push(info);
         } catch (e) {
           repos.push({ root: r, name: path.basename(r), branch: '?', error: e.message, changed: 0 });
@@ -623,7 +710,7 @@ function activate(context) {
   /* ── 注册 ── */
   context.subscriptions.push(
     channel,
-    statusItem,
+    { dispose: () => disposeDots() },
     { dispose: () => shell && shell.stop() },
     vscode.commands.registerCommand('branchOrbs.toggle', () => toggle()),
     vscode.commands.registerCommand('branchOrbs.refresh', async () => {
@@ -632,6 +719,46 @@ function activate(context) {
     }),
     vscode.commands.registerCommand('branchOrbs.show', () => toggle(true)),
     vscode.commands.registerCommand('branchOrbs.hide', () => toggle(false)),
+
+    /* 点当前仓库的豆子 = 切换悬浮球显示/隐藏。
+       单独注册一个显式命令（而不是直接把 'branchOrbs.toggle' 挂到豆子上），
+       是为了让豆子的 tooltip 里能写清"点击显示/隐藏"，也方便以后给豆子加额外动作。 */
+    vscode.commands.registerCommand('branchOrbs.dotActive', () => toggle()),
+
+    /* 点某颗非活动豆子：跳到那个仓库。
+       活动仓库的豆子绑定 toggle（开关悬浮球），因为"当前仓库"就在眼前，不需要再跳。
+       参数由豆子的 command 带上（见 renderStatus 里的 makeDot）。 */
+    vscode.commands.registerCommand('branchOrbs.focusRepo', (rootOrRepo) => {
+      let root = null;
+      if (typeof rootOrRepo === 'string') root = rootOrRepo;
+      else if (rootOrRepo && rootOrRepo.root) root = rootOrRepo.root;
+      if (!root) {
+        // 从命令面板/键位调用时没有参数 —— 弹个列表让用户选
+        return vscode.commands.executeCommand('branchOrbs.pick');
+      }
+      const repo = (diagnostic.repos || []).find((r) => r.root === root);
+      if (repo) openRepo(repo);
+    }),
+
+    /* 豆子被点开时，从仓库列表里选一个跳过去 */
+    vscode.commands.registerCommand('branchOrbs.pick', async () => {
+      if (!firstRefreshDone) await refresh(true); // 还没读完就点了：先催一次
+      const list = diagnostic.repos || [];
+      if (list.length === 0) {
+        vscode.window.showInformationMessage('Branch Orbs：还没有识别到任何 git 仓库。');
+        return;
+      }
+      const pick = await vscode.window.showQuickPick(
+        list.map((r) => ({
+          label: (r.isActive ? '$(circle-filled) ' : '$(circle-large-filled) ') + r.branch + ((r.changed || 0) > 0 ? ' ●' : ''),
+          description: r.name,
+          detail: r.root + '   ·   改动 ' + (r.changed || 0) + ' 个文件',
+          repo: r,
+        })),
+        { placeHolder: '跳转到哪个仓库？' }
+      );
+      if (pick && pick.repo) openRepo(pick.repo);
+    }),
     vscode.commands.registerCommand('branchOrbs.diag', async () => {
       ensureShell();
       const d = await diagnostic.request({ type: 'diag' }, 2500);
