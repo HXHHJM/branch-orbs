@@ -22,6 +22,26 @@ if (process.env.BRANCH_ORBS_USER_DATA) {
 
 app.commandLine.appendSwitch('ozone-platform-hint', 'auto');
 
+/* ── 关键开关：必须用 appendSwitch，不能靠命令行 ──
+   ⚠ 这条是本轮排查的核心教训。把 --no-sandbox / --disable-dev-shm-usage
+     写在可执行文件后面，这个 Electron 构建会直接拒绝：
+       electron: bad option: --no-sandbox
+     进程立刻退出，扩展侧只看到"壳进程运行中"然后马上死掉。
+   appendSwitch 在这里一定生效，且与 CLI 解析规则无关。
+
+   为什么非要 --disable-dev-shm-usage：
+     Chromium 的字体服务要把字体数据写共享内存，默认落在 /dev/shm。
+     容器/精简系统上 /dev/shm 常常只有 10~64MB，写满后直接 FATAL：
+       components/services/font_data/font_data_service_impl.cc:379
+       Check failed: . : 设备上没有空间 (28)
+     整个 renderer 崩溃 → 球永远画不出来，而日志干净得像没问题
+     （preload 注入成功、did-finish-load 成功、就是 balls:0）。 */
+app.commandLine.appendSwitch('disable-dev-shm-usage');
+if (process.platform === 'linux' && process.getuid && process.getuid() === 0) {
+  // root 下 Chromium 拒绝启用沙箱，必须显式关闭，否则启动即 FATAL
+  app.commandLine.appendSwitch('no-sandbox');
+}
+
 const logFile = process.env.BRANCH_ORBS_LOG || null;
 
 /* ⚠ 踩过的严重坑：日志写死循环，把磁盘灌了 454MB。
@@ -400,9 +420,38 @@ function createWindow() {
     state.win = null;
     setTimeout(bootBall, 400);
   });
+
+  /* ── 启动体检 ──
+     症状：壳起来了、窗口在正确位置，但球永远不出现，日志里连一条 page: 都没有。
+     根因可能有三层，逐层取证，否则只能瞎猜：
+       ① 页面文件根本没加载（路径错/环境变量没传）→ did-fail-load
+       ② preload 没注入（沙箱/contextIsolation 组合问题）→ window.orbs 不存在
+       ③ 页面脚本抛错但 console 事件没绑上 → 主动 executeJavaScript 探一下
+     这三行日志是"球不出现"时唯一能定位问题的证据，不要删。 */
+  win.webContents.on('did-finish-load', () => {
+    log('did-finish-load url=' + win.webContents.getURL());
+    win.webContents
+      .executeJavaScript(
+        '({orbs: typeof window.orbs, hasDock: !!document.getElementById("dock"), balls: document.querySelectorAll(".ball").length})',
+        true
+      )
+      .then((r) => log('page probe: ' + JSON.stringify(r)))
+      .catch((e) => log('page probe 失败: ' + e.message));
+  });
+  win.webContents.on('did-fail-load', (_e, code, desc, url) => {
+    log('did-fail-load code=' + code + ' desc=' + desc + ' url=' + url);
+  });
+  win.webContents.on('preload-error', (_e, p, err) => {
+    log('preload-error path=' + p + ' msg=' + (err && err.message));
+  });
+
   win.once('ready-to-show', () => {
+    log('ready-to-show → showInactive');
     win.showInactive();
     repaint(true);
+    try {
+      log('after show: visible=' + win.isVisible() + ' bounds=' + JSON.stringify(win.getBounds()));
+    } catch (_) {}
   });
   win.on('closed', () => {
     state.win = null;
@@ -629,10 +678,38 @@ function onLine(line) {
           anchors: a,
           repos: state.repos.map((r) => ({ name: r.name, branch: r.branch, changed: r.changed })),
           anchorWin,
+          /* workArea 单独给一份：扩展侧自检要显示它，之前只给了 displays 数组，
+             自检读到 undefined —— 看起来像"屏幕信息获取失败"，其实是没这个字段。 */
+          workArea: (() => {
+            try {
+              return workAreaFor(anchorWin);
+            } catch (_) {
+              return null;
+            }
+          })(),
           displays: screen.getAllDisplays().map((d) => ({ id: d.id, workArea: d.workArea, scale: d.scaleFactor })),
           drag: !!state.drag,
         },
       });
+      break;
+    }
+    /* 自测专用：把球窗口自己截一张图存下来。
+       容器里没有 import/xwd 之类的截图工具，而"球到底长什么样"
+       只能靠截图回答 —— capturePage 是 Electron 自带的，不依赖外部命令。 */
+    case 'screenshot': {
+      if (!state.win || state.win.isDestroyed()) {
+        send({ type: 'shot', id: m.id, error: 'no-window' });
+        break;
+      }
+      state.win.webContents
+        .capturePage()
+        .then((img) => {
+          const p = m.path || path.join(app.getPath('home'), '.branch-orbs', 'shot.png');
+          fs.mkdirSync(path.dirname(p), { recursive: true });
+          fs.writeFileSync(p, img.toPNG());
+          send({ type: 'shot', id: m.id, path: p, size: img.getSize() });
+        })
+        .catch((e) => send({ type: 'shot', id: m.id, error: e.message }));
       break;
     }
     case 'hit': {
@@ -643,6 +720,42 @@ function onLine(line) {
       // 仅用于自测：读一次全局指针（不轮询）
       const p = screen.getCursorScreenPoint();
       send({ type: 'screen-point', id: m.id, point: p });
+      break;
+    }
+    /* 自测专用：把页面真实的 DOM 状况吐出来。
+       "球不出现"时最需要知道的是：页面收到了 repos 吗？DOM 里有没有球节点？
+       这些答案只在 renderer 里，主进程看不到，所以留一个查询口。 */
+    case 'probe-dom': {
+      if (!state.win || state.win.isDestroyed()) {
+        send({ type: 'dom-probe', id: m.id, error: 'no-window' });
+        break;
+      }
+      state.win.webContents
+        .executeJavaScript(
+          `(function(){
+             var dock = document.getElementById('dock');
+             /* 球的真实类名是 .orb（不是 .sw —— 那是早期版本的名字）。
+                选错选择器会得到 balls:0 的假象，误判成"球没画出来"。 */
+             var orbs = dock ? dock.querySelectorAll('.orb') : [];
+             var styles = dock ? getComputedStyle(dock) : null;
+             return {
+               balls: orbs.length,
+               orbSizes: Array.prototype.map.call(orbs, function(o){
+                 var r = o.getBoundingClientRect();
+                 return Math.round(r.width) + 'x' + Math.round(r.height) + (o.classList.contains('active') ? '*' : '');
+               }),
+               dockChildren: dock ? dock.children.length : -1,
+               dockRect: dock ? (function(r){return {w:Math.round(r.width),h:Math.round(r.height)};})(dock.getBoundingClientRect()) : null,
+               dockDisplay: styles ? styles.display : null,
+               dockOpacity: styles ? styles.opacity : null,
+               bodyClass: document.body.className,
+               bodyHTMLlen: document.body.innerHTML.length,
+             };
+           })()`,
+          true
+        )
+        .then((r) => send({ type: 'dom-probe', id: m.id, data: r }))
+        .catch((e) => send({ type: 'dom-probe', id: m.id, error: e.message }));
       break;
     }
     default:

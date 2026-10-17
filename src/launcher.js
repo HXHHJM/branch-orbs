@@ -106,20 +106,40 @@ function findElectron(root) {
 /**
  * 若只能用 VSCode 自带的 Electron（它的 resources/app 是 VSCode 本体），
  * 就造一个极小的 app 目录把 resources/app 顶掉，让二进制去跑我们的 main.js。
+ *
+ * ⚠ 不能放 os.tmpdir()：容器/精简系统上 /tmp 常常是 10MB 的 tmpfs，
+ *   写 package.json 都可能失败；而且 /tmp 会被系统清理，壳启动到一半路径就没了。
+ *   放到 ~/.branch-orbs/shim 下（和 Electron 运行时同一个持久目录）。
  */
 function makeShimApp(root) {
-  const dir = path.join(os.tmpdir(), 'branch-orbs-app');
-  fs.mkdirSync(dir, { recursive: true });
+  const dir = path.join(os.homedir(), '.branch-orbs', 'shim');
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+  } catch (_) {
+    // HOME 不可写才退回 tmp
+    const alt = path.join(os.tmpdir(), 'branch-orbs-app');
+    fs.mkdirSync(alt, { recursive: true });
+    fs.writeFileSync(path.join(alt, 'package.json'), JSON.stringify({ name: 'branch-orbs', version: '0.1.0', main: path.join(root, 'shell', 'main.js') }));
+    return alt;
+  }
   const pkg = { name: 'branch-orbs', version: '0.1.0', main: path.join(root, 'shell', 'main.js') };
   fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify(pkg));
   return dir;
 }
 
+/* /dev/shm 太小会让 Chromium 的字体服务直接 FATAL 掉：
+     FATAL components/services/font_data/font_data_service_impl.cc:379
+     Check failed: . : 设备上没有空间 (28)
+   症状极具误导性 —— 壳进程活着、窗口在正确位置，但**球永远画不出来**，
+   日志里没有 page: 也没有 measure，看起来像"页面 JS 没跑"。
+   容器里 /dev/shm 常常只有 64MB 甚至 10MB，必须传 --disable-dev-shm-usage
+   让它改用 /tmp 做共享内存。 */
 function devShmTooSmall() {
   if (process.platform !== 'linux') return false;
   try {
     const out = execFileSync('df', ['-k', '/dev/shm'], { encoding: 'utf8' });
     const line = out.trim().split('\n').pop() || '';
+    // df -k 的第 4 列是 Available（字段顺序不是固定的，用正则找数字更稳）
     const kb = parseInt(line.split(/\s+/)[3], 10);
     if (Number.isFinite(kb)) return kb < 64 * 1024;
   } catch (_) {}
@@ -136,28 +156,61 @@ function launchArgs(root, opts) {
   const o = opts || {};
   const electron = o.electron || findElectron(root);
   if (!electron) return null;
+  /* ⚠ 不要把 Chromium 开关（--no-sandbox / --disable-dev-shm-usage /
+     --ozone-platform）放在命令行上！这个 Electron 构建会直接拒绝：
+       electron: bad option: --no-sandbox
+     进程秒退，扩展侧只看到"壳启动后立刻消失"。
+     这些开关统一在 shell/main.js 里用 app.commandLine.appendSwitch 设置
+     —— 那里一定生效，且不受 CLI 解析规则限制。
+     这里只负责：应用路径（顺序有意义）。 */
   const args = [];
   const bundled = path.join(root, 'shell', 'node_modules', 'electron', 'dist', 'electron');
   const isBundled = path.resolve(electron) === path.resolve(bundled);
   if (!isBundled) args.push(makeShimApp(root));
   args.push(path.join(root, 'shell'));
   if (o.extra) args.push(...o.extra);
-  args.push(...(BASE_FLAGS[process.platform] || []));
-  if (devShmTooSmall()) args.push('--disable-dev-shm-usage');
-  if (process.platform === 'linux' && process.getuid && process.getuid() === 0) args.push('--no-sandbox');
+
   return { electron, args, isBundled };
+}
+
+/* 壳进程的临时/数据目录 —— 全部落在 ~/.branch-orbs 下，**绝不用 os.tmpdir()**。
+   ⚠ 这是本轮排查出来的最深的坑：
+     容器/精简系统的 /tmp 常常是 10MB 的 tmpfs。Chromium 的字体服务
+     （font_data_service）要把字体数据写共享内存，空间不够就
+       FATAL components/services/font_data/font_data_service_impl.cc:379
+       Check failed: . : 设备上没有空间 (28)
+     整个 renderer 直接崩掉。症状极具误导性：
+       壳进程活着 / 窗口在正确位置 / preload 注入成功 / did-finish-load 成功
+       但 page probe 显示 balls:0，页面再也没上报 measure，日志干净得像没问题。
+     光加 --disable-dev-shm-usage 不够 —— 它只是把共享内存从 /dev/shm 挪到
+     TMPDIR，如果 TMPDIR 本身也是小 tmpfs，照样爆。
+     所以：TMPDIR + userData + 日志 全部指到 ~/.branch-orbs。 */
+function persistentTmp(root) {
+  const base = path.join(os.homedir(), '.branch-orbs', 'tmp');
+  try {
+    fs.mkdirSync(base, { recursive: true });
+    return base;
+  } catch (_) {
+    return os.tmpdir();
+  }
 }
 
 function spawnEnv(root, opts) {
   const env = { ...process.env };
   delete env.ELECTRON_RUN_AS_NODE;
   delete env.NODE_OPTIONS;
+  const tmp = (opts && opts.tmpdir) || persistentTmp(root);
   env.BRANCH_ORBS_HTML = path.join(root, 'shell', 'orbs.html');
-  env.BRANCH_ORBS_USER_DATA = (opts && opts.userData) || path.join(os.tmpdir(), 'branch-orbs-ud');
-  env.BRANCH_ORBS_LOG = (opts && opts.logFile) || path.join(os.tmpdir(), 'branch-orbs.log');
-  // 临时目录不要落在 10MB 的 /tmp 上
-  if (process.platform === 'linux' && (opts && opts.tmpdir)) env.TMPDIR = opts.tmpdir;
+  env.BRANCH_ORBS_USER_DATA = (opts && opts.userData) || path.join(os.homedir(), '.branch-orbs', 'shell-ud');
+  env.BRANCH_ORBS_LOG = (opts && opts.logFile) || path.join(tmp, 'branch-orbs.log');
+  if (process.platform === 'linux') {
+    env.TMPDIR = tmp;
+    env.TMP = tmp;
+    env.TEMP = tmp;
+    // Chromium 自己的缓存目录别落在 /tmp
+    env.XDG_CACHE_HOME = env.XDG_CACHE_HOME || path.join(os.homedir(), '.branch-orbs', 'cache');
+  }
   return env;
 }
 
-module.exports = { findElectron, launchArgs, spawnEnv, makeShimApp, devShmTooSmall, candidates, shallowFindElectron };
+module.exports = { findElectron, launchArgs, spawnEnv, makeShimApp, devShmTooSmall, persistentTmp, candidates, shallowFindElectron };
