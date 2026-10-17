@@ -2102,8 +2102,9 @@ function runPresentLab() {
     variants.forEach((v, i) => {
       try {
         const labEnv = Object.assign({}, process.env, { DISPLAY: process.env.DISPLAY || ':0' });
-        const p = cp.spawn(process.execPath, v.flags.concat(['--lab-idx=' + i, childJs]),
-          { detached: true, stdio: 'ignore', env: labEnv });
+        const childErr = fs.openSync(path.join(app.getPath('userData'), 'present-lab-' + i + '.log'), 'a');
+        const p = cp.spawn(process.execPath, v.flags.concat(['--enable-logging=stderr', '--lab-idx=' + i, childJs]),
+          { detached: true, stdio: ['ignore', childErr, childErr], env: labEnv });
         p.on('exit', (code, sig) => log('LAB 子窗退出', v.name, 'code', code, sig));
         p.on('error', (e) => log('LAB 子窗错误', v.name, e.message));
         p.unref();
