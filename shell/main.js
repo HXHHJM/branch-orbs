@@ -23,20 +23,61 @@ if (process.env.BRANCH_ORBS_USER_DATA) {
 app.commandLine.appendSwitch('ozone-platform-hint', 'auto');
 
 const logFile = process.env.BRANCH_ORBS_LOG || null;
+
+/* ⚠ 踩过的严重坑：日志写死循环，把磁盘灌了 454MB。
+   stdout 是管道，父进程（VSCode 扩展宿主）一退出，write() 就 **异步** 抛 EPIPE ——
+   这个异常 try/catch 抓不到，会直接进 uncaughtException。
+   而 uncaughtException 处理里又调 log() 写 stderr（也是管道，同样 EPIPE）…
+   于是"写日志失败 → 报错 → 再写日志"无限循环，一秒几万行。
+   修法三层：
+     ① log 里对 stderr 写入也包 try/catch，并且**出错就自废**（dead 标记）
+     ② stdout 挂 'error' 监听（异步 EPIPE 走这里，不再变成 uncaught）
+     ③ 日志文件超过上限就停写（防止任何意外把磁盘写满） */
+let logDead = false;
+let logBytes = 0;
+const LOG_MAX_BYTES = 2 * 1024 * 1024; // 2MB 上限，超了就不再追加
+
 function log(...args) {
-  const line = '[shell ' + new Date().toISOString().slice(11, 23) + '] ' + args.join(' ');
-  process.stderr.write(line + '\n');
-  if (logFile) {
+  if (logDead) return;
+  const line = '[shell ' + new Date().toISOString().slice(11, 23) + '] ' + args.join(' ') + '\n';
+  try {
+    process.stderr.write(line);
+  } catch (_) {
+    // stderr 也断了：说明父进程没了，彻底闭嘴（但不要递归）
+    logDead = true;
+  }
+  if (logFile && logBytes < LOG_MAX_BYTES) {
     try {
-      fs.appendFileSync(logFile, line + '\n');
+      if (logBytes === 0) logBytes = fs.existsSync(logFile) ? fs.statSync(logFile).size : 0;
+      if (logBytes < LOG_MAX_BYTES) {
+        fs.appendFileSync(logFile, line);
+        logBytes += Buffer.byteLength(line);
+      } else {
+        fs.appendFileSync(logFile, '[shell] 日志超过 2MB 上限，后续不再写入\n');
+      }
     } catch (_) {}
   }
 }
 
+/* stdout 的异步错误必须就地吃掉：否则每次 EPIPE 都会触发 uncaughtException，
+   而 uncaughtException 里又要发消息 → 又 EPIPE → 死循环。 */
+let outDead = false;
+if (process.stdout && typeof process.stdout.on === 'function') {
+  process.stdout.on('error', () => {
+    outDead = true; // 父进程已经走了，安静退出，别再刷
+    try {
+      app.quit();
+    } catch (_) {}
+  });
+}
+
 function send(msg) {
+  if (outDead) return;
   try {
     process.stdout.write(JSON.stringify(msg) + '\n');
-  } catch (_) {}
+  } catch (_) {
+    outDead = true;
+  }
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -658,9 +699,29 @@ if (process.env.BRANCH_ORBS_SINGLE === '1') {
   }
 }
 
+/* uncaughtException 只报一次就退出 —— 绝不能在这里继续写日志写消息：
+   之前这里 log + send，两者都可能 EPIPE，于是形成无限自激（磁盘被灌 454MB）。 */
+let fatalReported = false;
 process.on('uncaughtException', (e) => {
-  log('uncaught:', e && e.stack ? e.stack : String(e));
-  send({ type: 'fatal', message: String(e && e.message) });
+  if (fatalReported) return;
+  fatalReported = true;
+  const msg = e && e.message ? String(e.message) : String(e);
+  // EPIPE / 管道关闭 = 父进程没了，属于正常退出，不必当成崩溃
+  if (/EPIPE|ECONNRESET|ERR_STREAM_DESTROYED/.test(msg)) {
+    try {
+      app.quit();
+    } catch (_) {}
+    return;
+  }
+  try {
+    log('uncaught:', e && e.stack ? e.stack : String(e));
+  } catch (_) {}
+  send({ type: 'fatal', message: msg });
+  setTimeout(() => {
+    try {
+      process.exit(1);
+    } catch (_) {}
+  }, 100);
 });
 
 app.on('window-all-closed', () => {
