@@ -34,6 +34,10 @@ code --install-extension branch-orbs-0.1.0.vsix
 | 弹"找不到 Electron" | deb 版 VSCode 剥掉了 electron 模块 | `npm i -g electron` 后设 `BRANCH_ORBS_ELECTRON=$(which electron)`，重启 VSCode |
 | 有球但只有一个空窗 | 当前打开的目录不是 git 仓库 | 打开一个 `git init` 过的项目 |
 
+> 更完整的排查请查 **[`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md)** ——
+> 按现象查表，收录了 9 层实测根因（球不可见 / 点击被吞 / 连点失效 / 壳冻结 /
+> 误收聊天窗 / 输入区吞点击 / 双壳打架 / **VSCode 跑成 native Wayland**）与对应判定命令。
+
 ## 使用
 
 | 动作 | 效果 |
@@ -72,13 +76,22 @@ VSCode **只提供** `workbench.action.minimizeWindow`（收起），**没有取
 `_NET_WM_STATE_HIDDEN` 由窗口管理器异步更新，所以 `xwin.py` 每次动作后都会
 `wait_state()` 轮询到状态真正改变才返回（`settled` 字段），避免"连点两下失效"的竞态。
 
-**非 X11 环境**（Windows / macOS / Wayland-only / 没有 python-xlib）会自动降级成
-「跳转到该仓库」，不会报错。
+匹配到窗口后还有一道**进程命令行裁决**（`editor_verdict`）：读 `_NET_WM_PID` →
+`/proc/<pid>/cmdline`，只有确认属于 VSCode 系编辑器才允许收/展；
+属于聊天客户端等其他 Electron 应用（路径含 `/opt/<app>`）的窗口**一律拒绝**。
+兜底也从「屏幕上只有一个像编辑器的窗口就用它」改成了「唯一**通过裁决的**编辑器窗口」——
+**宁可没反应，绝不收错窗口**。
+
+未命中时只弹一句非模态提示，**不会去动宿主 UI**（旧版会执行 `workbench.view.scm` 切侧边栏，
+表现成「点一下界面乱跳」，已移除）。
+
+> ⚠ **Wayland 用户必读**：如果目标 VSCode 以 native Wayland 运行，X11 层面**根本不存在**它的窗口，
+> 匹配必然失败。判定与修复见 [`docs/TROUBLESHOOTING.md` 第 9 条](docs/TROUBLESHOOTING.md)。
 
 排查点击无效：
 
 ```bash
-# 看当前能匹配到哪些 VSCode 窗口
+# 看当前能匹配到哪些 VSCode 窗口（每个都带 verdict: editor / chat / null）
 python3 src/xwin.py list
 # 试匹配（不动窗口）
 python3 src/xwin.py probe 你的仓库名
@@ -138,6 +151,12 @@ src/extension.js  ──JSONL over stdin/stdout──▶  shell/main.js（独立
 4. **`setPosition()` 会涨尺寸**：只用 `setBounds` 且每次显式带 width/height。
 5. **绝不轮询 `screen.getCursorScreenPoint()`**：X11 下是事件驱动缓存，窗口穿透后读数冻结。
 6. **Linux `/dev/shm` < 64MB** 时 Chromium 会 FATAL，壳自动加 `--disable-dev-shm-usage`。
+7. **`setShape` 传的是 DIP，且内部会再乘 `scaleFactor`**：自己再乘一次就是双重换算，
+   shape 整体越界窗外 → 窗口 mapped、页面有像素、屏幕上却永远看不见。
+8. **`setShape` 同时裁剪绘制与输入**（当前 Electron 无 `setInputRegion`）：
+   输入区必须精确贴合球本身，横向铺满全宽会把下面所有窗口的底边点击全部吃掉。
+9. **native Wayland 窗口对 X11 完全不可见**（安全模型限制，非 bug）：
+   需要 `--ozone-platform=x11` 让目标跑 XWayland，见 `docs/TROUBLESHOOTING.md`。
 
 ## 开发 / 自测
 
