@@ -124,7 +124,7 @@ const logFile = process.env.BRANCH_ORBS_LOG || null;
      ③ 日志文件超过上限就停写（防止任何意外把磁盘写满） */
 let logDead = false;
 let logBytes = 0;
-const LOG_MAX_BYTES = 2 * 1024 * 1024; // 2MB 上限，超了就不再追加
+const LOG_MAX_BYTES = 2 * 1024 * 1024; // 2MB 触发轮转（.log → .log.1），不熔断
 
 function log(...args) {
   if (logDead) return;
@@ -135,15 +135,17 @@ function log(...args) {
     // stderr 也断了：说明父进程没了，彻底闭嘴（但不要递归）
     logDead = true;
   }
-  if (logFile && logBytes < LOG_MAX_BYTES) {
+  if (logFile) {
     try {
       if (logBytes === 0) logBytes = fs.existsSync(logFile) ? fs.statSync(logFile).size : 0;
-      if (logBytes < LOG_MAX_BYTES) {
-        fs.appendFileSync(logFile, line);
-        logBytes += Buffer.byteLength(line);
-      } else {
-        fs.appendFileSync(logFile, '[shell] 日志超过 2MB 上限，后续不再写入\n');
+      // ⚠ 超限不熔断：轮转成 .log.1（旧 .1 直接覆盖）后从零续写。
+      //   熔断会让"日志静默 + 进程活着"变成最难查的假死——本轮排查被坑过一次。
+      if (logBytes >= LOG_MAX_BYTES) {
+        try { fs.renameSync(logFile, logFile + '.1'); } catch (_) {}
+        logBytes = 0;
       }
+      fs.appendFileSync(logFile, line);
+      logBytes += Buffer.byteLength(line);
     } catch (_) {}
   }
 }
@@ -894,27 +896,59 @@ function syncShape(lane) {
     topDip = Math.max(0, Math.min(bands.hot.top, bands.card.top));
   }
   /* 先把 DIP 矩形算好，再整体换算到物理。宽度/高度也要乘 —— 只乘位置不乘尺寸
-     会得到一条"位置对了但高度不够"的窄带，球的下半部分照样被裁。 */
+     会得到一条"位置对了但高度不够"的窄带，球的下半部分照样被裁。
+
+     ⚠⚠⚠ 2026-10-18 点击吞吃修复（用户实测：点 VSCode 内部 → VSCode 被收起）：
+     旧实现 x=0、width=整个窗口宽 → 底部一整条横带都归球所有，底下任何窗口
+     的底边区域（编辑器状态栏、任务栏等）点击全被 overlay 吃掉，还会误触发
+     toggle。横向必须收窄到真实内容：静止态 = 球列 ±10px；交互态再并入
+     卡片（卡片 CSS 是窗口水平居中，left:50% + translateX(-50%)）。 */
+  const dL = a.bands.dock.left;
+  const dR = a.bands.dock.right;
+  let hx0 = dL - 10;
+  let hx1 = dR + 10;
+  if (!idle) {
+    const cardW = a.metrics.cardW || 0;
+    if (cardW > 0) {
+      hx0 = Math.min(hx0, a.win.width / 2 - cardW / 2 - 12);
+      hx1 = Math.max(hx1, a.win.width / 2 + cardW / 2 + 12);
+    }
+  }
   const dipRect = {
-    x: 0,
+    x: hx0,
     y: topDip,
-    width: a.win.width,
+    width: Math.max(1, hx1 - hx0),
     height: a.win.height - topDip,
   };
-  const physRect = {
-    x: Math.round(dipRect.x * sf),
-    y: Math.round(dipRect.y * sf),
-    width: Math.round(dipRect.width * sf),
-    height: Math.round(dipRect.height * sf),
+  /* ⚠⚠⚠ 2026-10-18 实测定案（决定性证据：X Shape GetRectangles 对照）：
+     Electron 的 setShape 内部会把 DIP 矩形 × scaleFactor 再下发给 X。
+     这里若再乘一次 sf 就是**双重换算**——实测 X 实际 shape 变成
+     (0,1076,2221,66)：y=1076 超出窗口物理高度 988、宽 2221 超出 1921，
+     可见区域完全落在窗外 → 窗口永远不可见。这正是"X 缓冲里有像素、
+     用户肉眼永远看不到球"的最终根因（1.15625 倍缩放屏上必现）。
+     所以这里直接传 DIP，并 clamp 进窗口 DIP 尺寸内（双保险）。 */
+  const wb = (() => { try { return w.getBounds(); } catch (_) { return null; } })();
+  const maxW = wb ? wb.width : dipRect.width;
+  const maxH = wb ? wb.height : dipRect.height;
+  const safeRect = {
+    x: Math.max(0, Math.min(dipRect.x, maxW - 1)),
+    y: Math.max(0, Math.min(dipRect.y, maxH - 1)),
+    width: 0,
+    height: 0,
   };
-  rects.push(clamp(physRect.x, physRect.y, physRect.width, physRect.height));
+  safeRect.width = Math.max(1, Math.min(dipRect.width, maxW - safeRect.x));
+  safeRect.height = Math.max(1, Math.min(dipRect.height, maxH - safeRect.y));
+  rects.push(clamp(safeRect.x, safeRect.y, safeRect.width, safeRect.height));
   try {
     if (typeof w.setShape === 'function') {
       w.setShape(rects);
       if (!shapeLogged) {
         shapeLogged = true;
-        log('setShape 生效（物理像素）: ' + JSON.stringify(rects) +
-          ' | DIP: ' + JSON.stringify(dipRect) + ' | scale ' + sf);
+        log('setShape 生效（DIP，Electron 内部×scale 下发）: ' + JSON.stringify(rects) +
+          ' | scale ' + sf + ' | 窗口DIP ' + JSON.stringify({ w: maxW, h: maxH }));
+      }
+      if (dipRect.y >= maxH) {
+        log('⚠ setShape 计算出越界矩形 y=' + dipRect.y + ' >= 窗高 ' + maxH + '，已强制 clamp 进窗口');
       }
     } else if (typeof w.setInputRegion === 'function') {
       w.setInputRegion(a.region);
@@ -1320,15 +1354,22 @@ let contentWatchTimer = null;
 let contentEmptyStreak = 0;
 let contentHealStage = 0;
 
-function bandColoredViaX() {
-  if (process.platform !== 'linux') return -1; // 非 linux 不监控
-  if (!state.win || state.win.isDestroyed()) return -1;
+/* ⚠ 2026-10-18：这个函数原为 execFileSync(timeout:5000)。
+   实测事故：WorkBuddy 最小化/恢复后壳主进程整体冻结 6 分钟+ —— 症状是
+   日志/轮询/点击全部停摆但进程与 X 窗口都还在。根因是 execFileSync 的
+   timeout 只对子进程发 SIGTERM，若 python 卡在不可中断的 X 调用上
+   （mutter grab 期间 X 请求被扣住），SIGTERM 杀不死它，Node 会**同步
+   等它退出直到永远**，整个事件循环冻结。
+   改为异步 execFile + SIGKILL 硬杀，回调返回，绝不阻塞主进程。 */
+function bandColoredViaX(cb) {
+  if (process.platform !== 'linux') { cb(-1); return; }
+  if (!state.win || state.win.isDestroyed()) { cb(-1); return; }
   try {
     const buf = state.win.getNativeWindowHandle();
     const id = buf.readUInt32LE(0);
-    if (!id || id === 1) return -1; // ozone 选错，另一个问题，不在这里处理
+    if (!id || id === 1) { cb(-1); return; } // ozone 选错，另一个问题，不在这里处理
     const py = pythonCandidates()[0];
-    if (!py) return -1;
+    if (!py) { cb(-1); return; }
     /* 球带（窗口内物理像素）：bottom 停靠 → 窗口底部 dockH+lift 那一条。
        传给 xlib 时全部乘 scale（GetImage 用物理像素，见 syncShape 的教训）。 */
     const sf = (() => {
@@ -1337,7 +1378,10 @@ function bandColoredViaX() {
     const met = anchors().metrics || {};
     const bandH = Math.max(4, Math.round(((met.dockH || 38) + (met.lift || 19)) * sf));
     const winPhysW = Math.round(state.win.getBounds().width * sf);
-    const out = require('child_process').execFileSync(py, ['-c', [
+    let done = false;
+    let child = null;
+    const once = (v) => { if (!done) { done = true; cb(v); } };
+    child = require('child_process').execFile(py, ['-c', [
       'import sys,json',
       'from Xlib import display,X',
       'd=display.Display(":0")',
@@ -1353,13 +1397,19 @@ function bandColoredViaX() {
       '        b,gr,r=row[x*4],row[x*4+1],row[x*4+2]',
       '        if abs(r-gr)>18 or abs(gr-b)>18 or abs(r-b)>18: c+=1',
       'print(c)',
-    ].join('\n'), '0x' + id.toString(16), String(bandH), String(winPhysW)], {
-      encoding: 'utf8', timeout: 5000, env: process.env,
+    ].join('\n'), '0x' + id.toString(16), String(bandH), String(winPhysW)    ], {
+      encoding: 'utf8', timeout: 4000, killSignal: 'SIGKILL', env: process.env,
+    }, (err, out) => {
+      if (err) { once(-1); return; }
+      once(parseInt(String(out || '').trim(), 10) || 0);
     });
-    return parseInt(out.trim(), 10) || 0;
-  } catch (_) {
-    return -1;
-  }
+    /* 双保险：timeout 机制失效时（子进程对 SIGTERM/SIGKILL 都无响应的 D 状态）
+       4.5s 后放弃等待 —— 回调只触发一次，进程留给 init 收割。 */
+    setTimeout(() => {
+      if (child) { try { child.kill('SIGKILL'); } catch (_) {} }
+      once(-1);
+    }, 4500);
+  } catch (_) { cb(-1); }
 }
 
 function healContent(stage) {
@@ -1394,25 +1444,28 @@ function startContentWatch() {
   if (contentWatchTimer || process.platform !== 'linux') return;
   contentWatchTimer = setInterval(() => {
     if (!state.win || state.win.isDestroyed() || !state.repos.length) return;
-    const n = bandColoredViaX();
-    if (n < 0) return; // 读不到（非 X 环境/handle 无效）就不下结论
-    if (n > 0) {
-      if (contentEmptyStreak > 0) log('X 内容自检恢复: 彩色像素 ' + n);
-      contentEmptyStreak = 0;
-      contentHealStage = 0;
-      return;
-    }
-    contentEmptyStreak++;
-    log('⚠ X 侧内容自检: 球带全空 (' + contentEmptyStreak + '/2)');
-    if (contentEmptyStreak >= 2) {
-      contentHealStage++;
-      healContent(contentHealStage);
-      contentEmptyStreak = 0;
-      /* stage 3 已改为"重建不透明窗口"（reload 对帧提交失效无济于事）。
-         若重建后仍然空（stage 4+），说明连不透明都呈现不了，
-         重置 stage 只会原地循环 → 改为永久停在 4，只留日志不再折腾。 */
-      if (contentHealStage > 4) contentHealStage = 4;
-    }
+    /* 异步版：bandColoredViaX 不再阻塞事件循环（见其函数头注释）。 */
+    bandColoredViaX((n) => {
+      if (!state.win || state.win.isDestroyed()) return;
+      if (n < 0) return; // 读不到（非 X 环境/handle 无效）就不下结论
+      if (n > 0) {
+        if (contentEmptyStreak > 0) log('X 内容自检恢复: 彩色像素 ' + n);
+        contentEmptyStreak = 0;
+        contentHealStage = 0;
+        return;
+      }
+      contentEmptyStreak++;
+      log('⚠ X 侧内容自检: 球带全空 (' + contentEmptyStreak + '/2)');
+      if (contentEmptyStreak >= 2) {
+        contentHealStage++;
+        healContent(contentHealStage);
+        contentEmptyStreak = 0;
+        /* stage 3 已改为"重建不透明窗口"（reload 对帧提交失效无济于事）。
+           若重建后仍然空（stage 4+），说明连不透明都呈现不了，
+           重置 stage 只会原地循环 → 改为永久停在 4，只留日志不再折腾。 */
+        if (contentHealStage > 4) contentHealStage = 4;
+      }
+    });
   }, 5000);
   log('X 内容自检已启动（每 5s 盯一次球带）');
 }
@@ -1516,12 +1569,17 @@ function createWindow() {
   //   与沙箱渲染器组合下拿不到，页面发来的 measure/hover/click 会被静默丢弃
   //   （症状：球画出来了，但窗口永远停在初始尺寸、悬停毫无反应）。
   //   两边都挂，用 channel 白名单去重，谁先到用谁。
-  const PAGE_CHANNELS = ['measure', 'hover', 'click', 'context', 'dragstart', 'dragmove', 'dragend', 'ready'];
+  const PAGE_CHANNELS = ['measure', 'hover', 'click', 'context', 'dragstart', 'dragmove', 'dragend', 'ready', 'diag'];
   // ⚠ 只对"一次性的动作"做去重（ready/click/context/drag*）。
   //   measure 和 hover 是状态同步，内容相同也必须每条都算 ——
   //   否则"卡片收起 → 报 0×0"会被和上一次的空态当成重复丢掉，
   //   窗口就永远停在悬停时的大尺寸上（球收不回来）。
-  const DEDUP = new Set(['ready', 'click', 'context', 'dragstart', 'dragmove', 'dragend']);
+  // ⚠⚠ 2026-10-18 实测：click 绝不能进 DEDUP！
+  //   去重 key = channel+payload，对同一颗球连点时 payload 全是 {"index":0}，
+  //   第 2~N 次 click 会被当成"重复消息"静默吞掉 —— 实测用户连点 5 次，
+  //   只有第 1 次触发了 toggleWindow，其余 4 次无任何日志（最难查的一类丢失）。
+  //   click 是动作不是状态，连续相同 click 全部合法。
+  const DEDUP = new Set(['ready', 'context', 'dragstart', 'dragmove', 'dragend']);
   const seen = new Set();
   function deliver(channel, payload) {
     if (!PAGE_CHANNELS.includes(channel)) return;
@@ -1535,6 +1593,12 @@ function createWindow() {
   }
   ipcMain.on('__orbs', (_e, channel, payload) => deliver(channel, payload));
   for (const ch of PAGE_CHANNELS) ipcMain.on(ch, (_e, payload) => deliver(ch, payload));
+  /* ⚠⚠ 2026-10-18 实测删除：webContents 'ipc-message' 双投递路径。
+     之前两条路同时挂着，同一帧每条消息会被 deliver 两次 ——
+     第二次 payload 恒为 {}（ipc-message 的 args 里没有内容），
+     日志里 "DIAG {}" 空记录就是它。去重机制一直在掩盖这个双投递，
+     而 click 恰好在 DEDUP 里 → 双投递 + 去重 = 真实点击被吞。
+     preload 走 ipcRenderer.send(channel, payload)，ipcMain.on(ch) 一条路就够。 */
   /* preload 把页面侧异常转发到这里。⚠ console-message 那条路在某些 Electron
      版本/合成路径下收不到页面 console.error，所以异常必须单独走一条 IPC。 */
   ipcMain.on('log', (_e, m) => {
@@ -1545,7 +1609,7 @@ function createWindow() {
     if (state.pageLogs.length > 200) state.pageLogs.splice(0, state.pageLogs.length - 200);
     log('PAGE-' + (m.level || 'log') + ': ' + m.text);
   });
-  win.webContents.on('ipc-message', (_e, channel, args) => deliver(channel, (args && args[0]) || {}));
+  /* （原 win.webContents.on('ipc-message', ...) 双投递路径已删除，见上） */
   win.webContents.on('console-message', (e, level, msg) => {
     log('page:', msg);
     send({ type: 'page-log', level, msg });
@@ -1787,6 +1851,10 @@ function pushState() {
 /* ───────────────────────── 页面事件 ───────────────────────── */
 
 function onPage(channel, m) {
+  if (channel === 'diag') {
+    log('DIAG ' + JSON.stringify(m));
+    return;
+  }
   if (channel === 'measure') {
     const next = {
       dockW: Math.max(1, Math.round(m.dockW || 0)),
@@ -2182,13 +2250,50 @@ app.whenReady().then(() => {
   try {
     app.dock && app.dock.hide();
   } catch (_) {}
+
+  /* ⚠ 单例锁（2026-10-18）：WorkBuddy 内嵌 IDE 与独立 VSCode 各有一个扩展宿主，
+     激活时各自 spawn 壳 → 桌面两颗球、两套输入带互相打架（实锤踩坑）。
+     规则：启动时查 ~/.branch-orbs/shell.lock，活壳（pid 活着且心跳 <15s）在 → 本实例直接退出；
+     否则写锁并每 5s 心跳，退出时清理自己的锁。自检（BRANCH_ORBS_TEST=1）完全旁路。 */
+  if (process.env.BRANCH_ORBS_TEST !== '1') {
+    const LOCK_FILE = path.join(os.homedir(), '.branch-orbs', 'shell.lock');
+    const lockWrite = () => {
+      try {
+        fs.mkdirSync(path.dirname(LOCK_FILE), { recursive: true });
+        fs.writeFileSync(LOCK_FILE, JSON.stringify({ pid: process.pid, t: Date.now() }));
+      } catch (_) {}
+    };
+    const lockAlive = (lk) => {
+      if (!lk || !lk.pid || !lk.t || Date.now() - lk.t > 15000) return false;
+      try { process.kill(lk.pid, 0); return true; } catch (_) { return false; }
+    };
+    let prev = null;
+    try { prev = JSON.parse(fs.readFileSync(LOCK_FILE, 'utf8')); } catch (_) {}
+    if (lockAlive(prev) && prev.pid !== process.pid) {
+      log('检测到活壳 pid=' + prev.pid + '（单例锁），本实例退出');
+      app.exit(0);
+      return;
+    }
+    lockWrite();
+    const hb = setInterval(lockWrite, 5000);
+    app.on('will-quit', () => {
+      clearInterval(hb);
+      try {
+        const lk = JSON.parse(fs.readFileSync(LOCK_FILE, 'utf8'));
+        if (lk && lk.pid === process.pid) fs.unlinkSync(LOCK_FILE);
+      } catch (_) {}
+    });
+  }
+
   /* 建窗口**之前**先问清楚有没有合成器。
      有 → 透明 overlay（球浮在桌面底边，理想形态）
      没有 → 不透明小窗（球贴在一条深色条上，退化但真的看得见）
      这个判断必须在 new BrowserWindow 之前，因为 transparent 是构造期选项。 */
   if (!detectCompositor()) state.opaque = true;
   bootBall();
-  runPresentLab();
+  /* 呈现实验室已定案（2026-10-18）：根因是 setShape 双重 DPI 换算，已修复。
+     实验默认关闭，需要复跑时设 BRANCH_ORBS_PRESENT_LAB=1。 */
+  if (process.env.BRANCH_ORBS_PRESENT_LAB === '1') runPresentLab();
   // ⚠ stdin 可能根本不存在（Playwright/Cron/某些启动器里为 null 或立刻 EOF）。
   // 直接给 process.stdin 挂 'end' 会在启动瞬间 quit，表现是
   // "Target page, context or browser has been closed" —— 而手动跑一切正常。

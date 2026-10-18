@@ -597,7 +597,7 @@ function activate(context) {
     anchors: null,
     repos: [],
     log: [],
-    shellAlive: () => !!(shell && shell.alive()),
+    shellAlive: () => !!(shell && shell.alive()) || shellAdopted,
     launch: launch ? { electron: launch.electron, args: launch.args } : null,
     lastConfig: () => lastCfg,
     send: (msg) => shell && shell.send(msg),
@@ -605,6 +605,22 @@ function activate(context) {
     refresh: () => refresh(),
     shellLog: () => (shell ? shell.recentLines.slice() : []),
   };
+
+  /* ── 单例锁（2026-10-18）：多宿主（内嵌 IDE + 独立 VSCode）会各自 spawn 壳 →
+     桌面两颗球互相打架。活壳健在时本宿主"复用"它：不 spawn、不接管 IPC——
+     点击由壳属主宿主处理，窗口匹配走 xwin 按标题/仓库名，与哪个宿主无关。
+     属主退出后锁过期，守护定时器会在下个周期接手 spawn。
+     自检（BRANCH_ORBS_TEST=1）旁路；锁与壳侧共用 ~/.branch-orbs/shell.lock。 */
+  const SHELL_LOCK_FILE = path.join(os.homedir(), '.branch-orbs', 'shell.lock');
+  let shellAdopted = false;
+  let shellAdoptPid = 0;
+  function readShellLock() {
+    try { return JSON.parse(fs.readFileSync(SHELL_LOCK_FILE, 'utf8')); } catch (_) { return null; }
+  }
+  function lockAlive(lk) {
+    if (!lk || !lk.pid || !lk.t || Date.now() - lk.t > 15000) return false;
+    try { process.kill(lk.pid, 0); return true; } catch (_) { return false; }
+  }
 
   function ensureShell() {
     if (!launch) {
@@ -636,6 +652,23 @@ function activate(context) {
       return null;
     }
     if (shell && shell.alive()) return shell;
+    /* 单例锁：已有活壳时复用，不重复 spawn（详见 SHELL_LOCK_FILE 注释） */
+    if (process.env.BRANCH_ORBS_TEST !== '1') {
+      const lk = readShellLock();
+      if (lockAlive(lk) && lk.pid !== process.pid) {
+        if (!shellAdopted || shellAdoptPid !== lk.pid) {
+          shellAdopted = true;
+          shellAdoptPid = lk.pid;
+          log('ensureShell: 已有活壳 pid=' + lk.pid + '，复用（单例锁），本宿主不重复生成');
+        }
+        return null;
+      }
+      if (shellAdopted) {
+        shellAdopted = false;
+        shellAdoptPid = 0;
+        log('ensureShell: 原属主壳已消失，本宿主接手 spawn');
+      }
+    }
     shell = new Shell({
       root,
       launch,
@@ -650,6 +683,35 @@ function activate(context) {
     shell.start();
     return shell;
   }
+  /* ── 壳心跳看门狗（2026-10-18）─────────────────────────────
+     实测事故：WorkBuddy 窗口最小化/恢复后，壳主进程事件循环被一个
+     卡死的同步 X 子进程整体冻结（日志/轮询/点击全部停摆，进程却活着）。
+     进程活着时进程退出回调不会触发，扩展永远不知道壳已经"植物人"。
+     对策：每 5s ping 一次，15s 内没有任何 pong/ready 回包
+     就 SIGKILL 强杀并重启壳 —— 无论卡因是什么都能自愈。
+     ⚠ 声明必须在 startPingWatchdog() 调用之前 —— 首次踩的就是 TDZ：
+       let 声明放在调用后面，函数体第一行 if (pingWatchdog) 直接
+       ReferenceError，activate 整体失败，表现是"扩展都不启动了"。 */
+  let lastPongAt = Date.now();
+  let pingWatchdog = null;
+  startPingWatchdog();
+
+  function startPingWatchdog() {
+    if (pingWatchdog) return;
+    pingWatchdog = setInterval(() => {
+      if (!shell || !shell.alive()) { lastPongAt = Date.now(); return; }
+      try { shell.send({ type: 'ping', t: Date.now() }); } catch (_) {}
+      if (Date.now() - lastPongAt > 15000) {
+        log('⚠ 壳 15s 无回包（主进程疑似卡死）→ SIGKILL 并重启');
+        try { shell.forceKill(); } catch (_) {}
+        shell = null;
+        lastPongAt = Date.now();
+        ensureShell();
+        pushConfig();
+        refresh(true);
+      }
+    }, 5000);
+  }
 
   function onShellEvent(m) {
     if (!m || !m.type) return;
@@ -660,8 +722,12 @@ function activate(context) {
         refresh();
         break;
       case 'ready':
+        lastPongAt = Date.now();
         pushConfig();
         refresh();
+        break;
+      case 'pong':
+        lastPongAt = Date.now();
         break;
       case 'click': {
         const repo = m.repo || diagnostic.repos[m.index];
@@ -972,10 +1038,17 @@ function activate(context) {
       if (!out || !out.ok || !out.changed) {
         const why = (out && (out.error || JSON.stringify(out.detail || []))) || 'no-output';
         log(
-          'toggleWindow 未命中窗口：' + JSON.stringify(kws) + ' pid=' + ownerPid + ' → ' + why +
-            '（退回跳转仓库）'
+          'toggleWindow 未命中窗口：' + JSON.stringify(kws) + ' pid=' + ownerPid + ' → ' + why
         );
-        openRepo(repo);
+        // ⚠ 2026-10-18 用户实测定案：未命中窗口时绝不能动宿主 UI——
+        //   旧兜底 openRepo → workbench.view.scm 会把内嵌 IDE 的侧边栏
+        //   切来切去，被用户感知为"点一下编辑器就被收起/乱跳"。
+        //   未命中 = 系统里没有该仓库的独立 VSCode 窗口，正确行为是
+        //   什么都不做，只提示一句原因。
+        vscode.window.showInformationMessage(
+          '未找到 ' + repo.name + ' 的独立 VSCode 窗口，点击悬浮球无动作',
+          { modal: false }
+        );
         return;
       }
       const d0 = (out.detail || [])[0] || {};
@@ -1185,6 +1258,18 @@ function activate(context) {
 
   // 兜底：每隔一会儿把 anchors 同步进诊断，并确保壳还没死
   const timer = setInterval(() => {
+    if (shellAdopted) {
+      /* 复用模式下定期核对锁：属主壳退出（锁过期）就由本宿主接手 spawn */
+      const lk = readShellLock();
+      if (lockAlive(lk) && lk.pid === shellAdoptPid) return;
+      log('复用的壳已消失，本宿主接手 spawn');
+      shellAdopted = false;
+      shellAdoptPid = 0;
+      ensureShell();
+      pushConfig();
+      refresh(true);
+      return;
+    }
     if (!shell) return;
     pushAnchor();
     if (!shell.alive() && vscode.workspace.getConfiguration('branchOrbs').get('enabled', true)) {

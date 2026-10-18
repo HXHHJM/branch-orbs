@@ -135,6 +135,16 @@ class Shell {
     this.proc = null;
   }
 
+  /* 强杀：主进程卡死（事件循环冻结）时 SIGTERM 可能无效，直接 SIGKILL。 */
+  forceKill() {
+    const p = this.proc;
+    this.proc = null;
+    if (!p) return;
+    try { p.stdin.end(); } catch (_) {}
+    try { p.kill('SIGKILL'); } catch (_) {}
+    setTimeout(() => { try { p.kill('SIGKILL'); } catch (_) {} }, 300);
+  }
+
   log(...args) {
     if (this.opts.logger) this.opts.logger(args.join(' '));
   }

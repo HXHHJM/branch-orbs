@@ -371,8 +371,22 @@
 
   /* ── 点击 / 拖动 / 右键 ── */
   var down = null;
+  /* 诊断：窗口内任何位置的按下都记一条（dock 之外的点击不会触发上面的埋点） */
+  document.addEventListener('pointerdown', function (e) {
+    try {
+      post('diag', { kind: 'doc-pointerdown', x: e.clientX, y: e.clientY,
+        cls: String((e.target && e.target.className) || '').slice(0, 60) });
+    } catch (_) {}
+  }, true);
   dock.addEventListener('pointerdown', function (e) {
     var t = orbAt(e.target);
+    /* ⚠ 2026-10-18 诊断埋点：点击"没反应"时必须知道每次 pointerdown 的真实
+       落点与目标元素 —— orbAt 失配会在这里被静默丢弃，日志一片干净。 */
+    try {
+      post('diag', { kind: 'pointerdown', x: e.clientX, y: e.clientY,
+        cls: String((e.target && e.target.className) || '').slice(0, 60),
+        orb: !!t, i: t ? +t.dataset.i : -1 });
+    } catch (_) {}
     if (!t) return;
     down = { i: +t.dataset.i, sx: e.screenX, sy: e.screenY, moved: false, button: e.button, id: e.pointerId };
     /* ⚠⚠ 这里**不调 setPointerCapture**。踩过的坑，非常隐蔽：
@@ -404,7 +418,11 @@
     if (down.moved) post('dragmove', { screenX: e.screenX, screenY: e.screenY });
   });
   window.addEventListener('pointerup', function (e) {
-    if (!down) return;
+    if (!down) {
+      /* 诊断：收到 pointerup 却没有配对的 pointerdown —— 说明 down 被丢了 */
+      try { post('diag', { kind: 'pointerup-no-down', x: e.clientX, y: e.clientY }); } catch (_) {}
+      return;
+    }
     var d = down; down = null;
     if (d.moved) { post('dragend', {}); return; }
     if (d.button === 0) post('click', { index: d.i });

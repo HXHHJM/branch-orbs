@@ -121,7 +121,8 @@ def is_hidden(d, w):
 # 各类 VSCode 衍生版的 WM_CLASS 关键字。
 # ⚠ 不能只查 "code"：VSCodium 的类名是 "VSCodium"，里面没有 "code" 子串，
 #   漏掉会让所有球都点不动，而报错信息只有 no-matching-window，极难定位。
-CODE_CLASS_HINTS = ("code", "vscodium", "codium", "code-oss", "cursor", "windsurf")
+CODE_CLASS_HINTS = ("code", "vscodium", "codium", "code-oss", "cursor", "windsurf",
+                    "workbuddy", "codebuddy")
 
 
 def is_code_like(cls):
@@ -129,6 +130,43 @@ def is_code_like(cls):
     取 instance 或 class 任一段包含任一关键字（不区分大小写）即算。"""
     low = (cls or "").lower()
     return any(h in low for h in CODE_CLASS_HINTS)
+
+
+# ─────────────────── 进程命令行验证（2026-10-18） ───────────────────
+# 背景：WorkBuddy 聊天窗的 WM_CLASS 是 "workbuddy"，被 CODE_CLASS_HINTS 放行后，
+#   only-window 兜底把聊天窗当成编辑器最小化了——用户连点球收掉的都是聊天窗。
+# 类名不可信，用 _NET_WM_PID → /proc/<pid>/cmdline 做最终裁决。
+def proc_cmdline(pid):
+    try:
+        with open("/proc/%d/cmdline" % pid, "rb") as f:
+            return f.read().replace(b"\0", b" ").decode("utf-8", "replace").strip()
+    except Exception:
+        return ""
+
+
+# 聊天/宿主类应用：WorkBuddy 主程序（含其派生的一切子进程路径）
+CHAT_PROC_MARKERS = ("/opt/workbuddy", "/workbuddy/workbuddy")
+# 编辑器类应用：各 VSCode 衍生版的可执行文件路径特征
+EDITOR_PROC_MARKERS = ("/share/code/code", "/code/code", "/code-bin", "code.exe",
+                       "code-insiders", "vscodium", "/codium", "code-oss",
+                       "cursor", "windsurf")
+
+
+def editor_verdict(d, w):
+    """裁决窗口归属：'editor'（VSCode 系）/ 'chat'（聊天宿主）/ None（无法判定）。
+    ⚠ None 不等于放行候选之外的兜底：读不到 /proc（如容器隔离）时保持旧行为，
+      但能读到 cmdline 时以 cmdline 为准 —— 类名可以被宿主任意起，cmdline 不会撒谎。"""
+    wp = window_pid(d, w)
+    if not wp:
+        return None
+    cl = proc_cmdline(wp).lower()
+    if not cl:
+        return None
+    if any(m in cl for m in CHAT_PROC_MARKERS):
+        return "chat"
+    if any(m in cl for m in EDITOR_PROC_MARKERS):
+        return "editor"
+    return "other"
 
 
 # ─────────────────── 等待窗口状态稳定 ───────────────────
@@ -238,6 +276,7 @@ def cmd_list(d, as_json=True):
                 "hidden": is_hidden(d, w),
                 "pid": window_pid(d, w),
                 "class": cls,
+                "verdict": editor_verdict(d, w),
             }
         )
     return rows
@@ -245,14 +284,51 @@ def cmd_list(d, as_json=True):
 
 def cmd_action(d, cmd, keywords, pid, require_code):
     hits = match(d, keywords, pid, require_code)
+    # ⚠ 2026-10-18 安全过滤：pid 匹配可能因 windowOwnerPid 过冲命中聊天窗
+    #   （WorkBuddy 主进程是扩展宿主的祖先），类名 "workbuddy" 又在白名单里。
+    #   能读到 cmdline 时，非 editor 一律拒绝 —— 宁可不动，不可收错窗。
+    verified = []
+    skipped = []
+    for (w, title, s, how) in hits:
+        v = editor_verdict(d, w)
+        if v in ("editor", None):
+            verified.append((w, title, s, dict(how, verdict=v)))
+        else:
+            skipped.append({"title": title, "verdict": v, "pid": window_pid(d, w)})
+    hits = verified
+    fallback = None
+    if not hits and require_code:
+        # ⚠ 2026-10-18 实测：WorkBuddy 内嵌 IDE 场景下
+        #   ① 扩展宿主父链 pid（如 3032092）≠ X 窗口 _NET_WM_PID（9535），pid 必然不中；
+        #   ② 窗口标题就是 "WorkBuddy"，不含仓库路径，关键字也必然不中。
+        #   三级兜底：pid → 关键字 → （屏幕上只有一个"真正的编辑器"窗口时）直接命中它。
+        #   ⚠ 必须过 editor_verdict：聊天窗类名也是 "workbuddy"，仅靠类名兜底
+        #     会把聊天窗当编辑器收掉（本轮已实锤踩坑）。cmdline 读不到（None）保持旧行为。
+        editor_wins = []
+        for w in client_windows(d):
+            if not is_code_like(window_class(d, w)):
+                continue
+            if editor_verdict(d, w) == "chat":
+                continue
+            editor_wins.append(w)
+        if len(editor_wins) == 1:
+            fallback = {"by": "only-editor"}
+            only_w = editor_wins[0]
+            hits = [(only_w, window_title(d, only_w), 10, fallback)]
     if not hits:
         return {
             "ok": False,
             "error": "no-matching-window",
             "keywords": keywords,
             "pid": pid,
-            "code_windows": [r["title"] for r in cmd_list(d)],
+            "fallback": fallback,
+            "skipped": skipped,
+            "code_windows": [
+                {"title": r["title"], "verdict": r.get("verdict")} for r in cmd_list(d)
+            ],
         }
+    if fallback:
+        pass  # detail 里带 how=only-window 便于排查
 
     changed = 0
     detail = []
@@ -275,8 +351,26 @@ def cmd_action(d, cmd, keywords, pid, require_code):
             ok = wait_state(d, w, False)
         changed += 1
         detail.append({"title": title, "to": "hidden" if want else "visible", "settled": ok, "by": how.get("by")})
+        # ⚠ 2026-10-18 新增：toggle 后盯 2 秒，看 WM 会不会把状态弹回去。
+        #   背景：日志 settled=true 但用户坚称屏幕没变化 —— 只有两种可能：
+        #   ① mutter 最小化后立刻又恢复（竞态/焦点策略），② settled 判定有假。
+        #   这里持续回读状态，若 2s 内弹回，在审计里记 reverted，一次点击就能定案。
+        try:
+            reverted = False
+            deadline = time.time() + 2.0
+            while time.time() < deadline:
+                if is_hidden(d, w) != want:
+                    reverted = True
+                    break
+                time.sleep(0.05)
+            detail[-1]["stable2s"] = (not reverted)
+            if reverted:
+                detail[-1]["reverted"] = True
+        except Exception:
+            pass
 
-    return {"ok": True, "cmd": cmd, "changed": changed, "hits": len(hits), "detail": detail}
+    return {"ok": True, "cmd": cmd, "changed": changed, "hits": len(hits),
+            "skipped": skipped, "detail": detail}
 
 
 def cmd_selftest(d):
@@ -309,15 +403,29 @@ def cmd_selftest(d):
     return {"ok": True, "passed": passed, "title": title, "window": hex(w.id), "steps": steps}
 
 
+def _audit(record):
+    """每次调用落盘一条 JSON 行，便于无 OutputChannel 时排查点击链路。"""
+    try:
+        p = os.path.join(os.path.expanduser("~"), ".branch-orbs", "xwin.log")
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
 def main():
     argv = sys.argv[1:]
     cmd = argv[0] if argv else "list"
     pid, require_code, keywords = parse_args(argv[1:] if argv else [])
+    _out = {"t": time.time(), "argv": argv, "ppid": os.getppid()}
 
     d = connect()
     if d is None:
         # 必须返回 0：无显示环境是"功能不可用"，不是"执行出错"。
-        print(json.dumps({"ok": False, "error": "no-display", "display": DISPLAY}, ensure_ascii=False))
+        _out["result"] = {"ok": False, "error": "no-display", "display": DISPLAY}
+        _audit(_out)
+        print(json.dumps(_out["result"], ensure_ascii=False))
         return 0
 
     try:
@@ -340,10 +448,18 @@ def main():
         elif cmd == "selftest":
             print(json.dumps(cmd_selftest(d), ensure_ascii=False))
         elif cmd in ("toggle", "activate", "minimize"):
-            print(json.dumps(cmd_action(d, cmd, keywords, pid, require_code), ensure_ascii=False))
+            r = cmd_action(d, cmd, keywords, pid, require_code)
+            _out["result"] = r
+            print(json.dumps(r, ensure_ascii=False))
         else:
             print(json.dumps({"ok": False, "error": "unknown-command", "cmd": cmd}, ensure_ascii=False))
     finally:
+        if cmd in ("toggle", "activate", "minimize", "probe", "list", "selftest"):
+            try:
+                _out.setdefault("result", {"ok": None})
+            except Exception:
+                pass
+            _audit(_out)
         try:
             d.close()
         except Exception:
